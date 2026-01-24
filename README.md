@@ -1,6 +1,6 @@
 # CF-Emby-Proxy
 
-基于 Cloudflare Workers 的 Emby 媒体服务器代理加速服务，通过智能缓存策略提升访问速度。
+基于 Cloudflare Workers 的 Emby 媒体服务器代理加速服务，通过智能缓存策略提升访问速度，基于原项目更新了动态路由,安卓tv优化和自动部署
 
 ## 功能特性
 
