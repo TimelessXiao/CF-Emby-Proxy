@@ -1,6 +1,7 @@
 # CF-Emby-Proxy
 
 基于 Cloudflare Workers 的 Emby 媒体服务器代理加速服务，通过智能缓存策略提升访问速度，基于原项目更新了动态路由,安卓tv优化和自动部署
+，动态路由，在cloudflare设置了*.abc.com/*后，后台路由管理器就是 任意前缀.abc.com
 
 ## 功能特性
 
