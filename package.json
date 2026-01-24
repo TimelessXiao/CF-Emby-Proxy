@@ -1,0 +1,27 @@
+{
+  "name": "cf-emby-proxy",
+  "version": "1.0.0",
+  "description": "",
+  "main": "worker.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "setup": "node scripts/setup.js",
+    "dev": "wrangler dev --config wrangler.json",
+    "deploy": "wrangler deploy --config wrangler.json",
+    "postinstall": "node -e \"console.log('\\n\\x1b[36m提示：首次使用请运行 \\x1b[1mnpm run setup\\x1b[0m\\x1b[36m 进行环境配置\\x1b[0m\\n')\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "private": true,
+  "dependencies": {
+    "hono": "^4.11.5"
+  },
+  "devDependencies": {
+    "wrangler": "^4.54.0"
+  }
+}
