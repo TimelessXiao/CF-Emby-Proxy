@@ -366,14 +366,22 @@ async function setAdminSecret(rl) {
     }
 
     console.log(colorize('[非交互模式] 使用环境变量 ADMIN_TOKEN', colors.yellow));
-    // Use echo to pipe the token to wrangler secret put
-    const cmd = isWindows() ?
-      `echo ${adminToken} | npx -y wrangler secret put ADMIN_TOKEN --config wrangler.json` :
-      `echo "${adminToken}" | npx -y wrangler secret put ADMIN_TOKEN --config wrangler.json`;
+    console.log('> npx -y wrangler secret put ADMIN_TOKEN --config wrangler.json');
 
-    const { code } = await spawnp(isWindows() ? 'cmd' : 'sh',
-      isWindows() ? ['/c', cmd] : ['-c', cmd],
-      { stdio: 'inherit' });
+    // Use stdin to pass token securely (avoid shell interpolation)
+    const proc = cp.spawn(cmdBin('npx'), ['-y', 'wrangler', 'secret', 'put', 'ADMIN_TOKEN', '--config', 'wrangler.json'], {
+      cwd: ROOT,
+      stdio: ['pipe', 'inherit', 'inherit'],
+      shell: isWindows() // Windows needs shell for .cmd files
+    });
+
+    proc.stdin.write(adminToken + '\n');
+    proc.stdin.end();
+
+    const code = await new Promise((resolve) => {
+      proc.on('close', resolve);
+      proc.on('error', () => resolve(1));
+    });
 
     if (code !== 0) throw new Error('设置 ADMIN_TOKEN 密钥失败。');
     return;
