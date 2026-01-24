@@ -269,61 +269,86 @@ async function createKvNamespace(title) {
 async function kvFlow(rl) {
   banner('KV Namespace (ROUTE_MAP) 设置');
   console.log('KV Namespace 用于存储路由映射规则。');
-  console.log('我们需要创建两个 Namespace：一个用于生产环境，一个用于预览环境。');
 
   // Non-interactive mode: use KV IDs from environment
   if (isNonInteractive()) {
     const id = process.env.KV_NAMESPACE_ID;
-    const preview_id = process.env.KV_PREVIEW_ID || id; // Use same ID if preview not specified
+    const preview_id = process.env.KV_PREVIEW_ID;
 
     if (!id) {
-      throw new Error('非交互模式需要环境变量 KV_NAMESPACE_ID（可选：KV_PREVIEW_ID）');
+      throw new Error('非交互模式需要环境变量 KV_NAMESPACE_ID');
     }
 
-    if (!isHex32(id) || (preview_id && !isHex32(preview_id))) {
-      throw new Error('无效的 KV ID 格式。需要 32 位十六进制字符串。');
+    if (!isHex32(id)) {
+      throw new Error(`无效的 KV ID 格式: ${id}。需要 32 位十六进制字符串。`);
     }
 
-    console.log(colorize(`[非交互模式] 使用环境变量中的 KV IDs`, colors.yellow));
-    console.log(`  - id: ${id}`);
-    console.log(`  - preview_id: ${preview_id}`);
-    return { id, preview_id };
+    if (preview_id) {
+      if (!isHex32(preview_id)) {
+        throw new Error(`无效的 KV_PREVIEW_ID 格式: ${preview_id}。需要 32 位十六进制字符串。`);
+      }
+      console.log(colorize(`[非交互模式] 使用独立的预览环境 KV ID`, colors.yellow));
+      console.log(`  - 生产环境: ${id}`);
+      console.log(`  - 预览环境: ${preview_id}`);
+      return { id, preview_id };
+    }
+
+    console.log(colorize(`[非交互模式] 使用 KV Namespace ID: ${id}`, colors.yellow));
+    console.log(colorize(`  提示: 预览环境将使用相同的 KV（如需独立，请设置 KV_PREVIEW_ID）`, colors.yellow));
+    return { id, preview_id: id };
   }
 
   const useExisting = await askYN(rl, '使用现有的 KV namespace ID？', false);
   if (useExisting) {
-    const id = (await ask(rl, '输入 KV id: ')).trim();
-    const previewId = (await ask(rl, '输入 KV preview_id: ')).trim();
-    if (!isHex32(id) || !isHex32(previewId)) {
-      throw new Error('无效的 KV id/preview_id。需要 32 位十六进制字符串。');
-    }
-    return { id, preview_id: previewId };
-  }
-  console.log('脚本将使用您提供的前缀自动创建两个 Namespace (生产环境和预览环境)。');
-  const base = (await ask(rl, 'Namespace 标题前缀 [cf-emby-proxy-ROUTE_MAP]: ')).trim() || 'cf-emby-proxy-ROUTE_MAP';
-  console.log(`正在创建 KV namespaces："${base}" 和 "${base}-preview"...`);
+    console.log(colorize('\n提示：KV Namespace ID 是一个 32 位的十六进制字符串。', colors.cyan));
+    console.log(colorize('您可以在 Cloudflare Dashboard > Workers & Pages > KV 中找到它。', colors.cyan));
+    console.log(colorize('或者运行命令：npx wrangler kv namespace list', colors.cyan));
+    console.log(colorize('示例 ID：067e56067e56067e56067e56067e5606', colors.cyan) + '\n');
 
-  let id;
-  let preview_id;
-  try {
-    id = await createKvNamespace(base);
-    preview_id = await createKvNamespace(`${base}-preview`);
-  } catch (e) {
-    if (id) {
-      console.error(colorize('\n创建预览 namespace 失败。正在尝试回滚...', colors.yellow));
-      try {
-        await runOrThrow('npx', ['-y', 'wrangler', 'kv', 'namespace', 'delete', '--namespace-id', id]);
-        console.log(colorize('回滚成功：已删除 namespace ' + id, colors.green));
-      } catch (rollbackErr) {
-        console.error(colorize('回滚失败。请手动删除孤立的 namespace：', colors.red));
-        console.error(`  npx wrangler kv namespace delete --namespace-id ${id}`);
+    let id = '';
+    while (!isHex32(id)) {
+      id = (await ask(rl, '输入生产环境 KV ID (32位 hex): ')).trim();
+      if (!id) continue;
+      if (!isHex32(id)) {
+        console.error(colorize('错误：无效的 ID 格式。请输入 32 位十六进制字符串。', colors.red));
+        id = ''; // Reset to ensure loop continues
       }
     }
+
+    let previewId = (await ask(rl, '输入预览环境 KV ID (可选，回车跳过): ')).trim();
+    if (previewId && !isHex32(previewId)) {
+      console.warn(colorize('警告：预览环境 ID 格式无效，将忽略该输入并使用生产环境 ID。', colors.yellow));
+      previewId = '';
+    }
+
+    if (!previewId) {
+      console.log(colorize('\n注意：预览环境将使用相同的 KV Namespace。', colors.yellow));
+      console.log(colorize('这意味着预览部署的写操作会影响生产数据。', colors.yellow));
+      const confirm = await askYN(rl, '确认使用相同的 KV？', true);
+      if (!confirm) {
+        console.log(colorize('已取消。请重新运行脚本并提供独立的预览环境 KV ID。', colors.red));
+        throw new Error('用户取消操作。');
+      }
+      previewId = id;
+    }
+
+    return { id, preview_id: previewId };
+  }
+  console.log('脚本将创建一个 KV Namespace 用于生产环境。');
+  console.log(colorize('提示：预览环境将使用相同的 KV（适用于只读或测试场景）。', colors.cyan));
+  const base = (await ask(rl, 'Namespace 标题 [cf-emby-proxy-ROUTE_MAP]: ')).trim() || 'cf-emby-proxy-ROUTE_MAP';
+  console.log(`正在创建 KV namespace: "${base}"...`);
+
+  let id;
+  try {
+    id = await createKvNamespace(base);
+  } catch (e) {
     throw e;
   }
 
-  console.log(colorize(`创建成功：\n - id: ${id}\n - preview_id: ${preview_id}`, colors.green));
-  return { id, preview_id };
+  console.log(colorize(`创建成功: ${id}`, colors.green));
+  console.log(colorize('预览环境将使用相同的 KV Namespace。', colors.yellow));
+  return { id, preview_id: id };
 }
 
 async function generateWranglerJson(ids, rl) {
