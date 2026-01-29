@@ -1,22 +1,23 @@
 import { Hono } from 'hono'
 
 const CONFIG = {
-  UPSTREAM_URL: 'https://your-emby-server.com', // Replace with your Emby server URL
-  
-  // [关键修复] 
+  UPSTREAM_URL: 'https://your-emby-server.com', // Default upstream URL (can be overridden by env.UPSTREAM_URL)
+
+  // [关键修复]
   // 1. 匹配带后缀的文件
   // 2. 匹配 Emby 特有的无后缀图片路径 (/Images/Primary, /Images/Backdrop 等)
   STATIC_REGEX: /(\.(jpg|jpeg|png|gif|css|js|ico|svg|webp|woff|woff2)|(\/Images\/(Primary|Backdrop|Logo|Thumb|Banner|Art)))/i,
-  
+
   // 视频流 (直连，不缓存，不重试)
   VIDEO_REGEX: /(\/Videos\/|\/Items\/.*\/Download|\/Items\/.*\/Stream)/i,
-  
+
   // [新增] 慢接口微缓存 (解决 Resume 1.5s 的问题)
   // 缓存 API 响应 5-10秒，大幅提升"返回/进入"页面的流畅度，同时不影响数据准确性
   API_CACHE_REGEX: /(\/Items\/Resume|\/Users\/.*\/Items\/)/i,
-  
+
   // API超时设置
-  API_TIMEOUT: 2500,
+  API_TIMEOUT: 4500,
+  CRITICAL_TIMEOUT: 9000,
 
   // Android TV/ExoPlayer 识别
   ANDROID_TV_UA: /(ExoPlayer|AFT|BRAVIA|MiTV|SHIELD|GoogleTV|FireTV|Chromecast|Android TV)/i,
@@ -27,6 +28,9 @@ const CONFIG = {
   PLAYBACKINFO_REGEX: /\/PlaybackInfo/i,
   M3U8_TTL: 2,
   PLAYBACKINFO_TTL: 3,
+
+  // 最大允许缓冲请求体大小（字节）
+  MAX_BODY_BUFFER: 262144,
 
   // 路由表内存缓存 TTL（秒）
   ROUTE_CACHE_TTL: 60
@@ -87,13 +91,78 @@ async function buildTokenKey(req, url) {
   return sha256Hex(`${tokenPart}:${devicePart}`)
 }
 
+// RFC 7230 hop-by-hop header cleanup (CORRECT ORDER + WebSocket Protection)
+//
+// 正确顺序（关键）：
+// 1. 先读取 Connection 的值（如果存在）并解析 token
+// 2. 再删除固定 hop-by-hop 列表
+// 3. 再删除解析出来的 token 字段名
+// 4. 最后删除 Connection 本身
+//
+// 参数：
+// - headers: Headers对象
+// - preserveUpgrade: 是否保留Upgrade头（WebSocket/101响应时为true）
+//   修正F：当前调用策略下，此参数基本不会生效（WS请求侧不调用、101响应侧不调用）
+//   保留此参数仅用于将来可能出现的非标准场景，避免实现者误用
+// - isRequest: 是否为请求侧（请求侧不删除proxy-*头）
+function cleanupHopByHopHeaders(headers, preserveUpgrade = false, isRequest = false) {
+  if (!headers) return
+
+  // Step 1: 先读取并解析 Connection 头的值（在删除之前！）
+  const connVal = headers.get('Connection') || headers.get('connection')
+  const dynamicHopByHop = []
+  if (connVal) {
+    // Parse comma-separated field-names; case-insensitive; trim whitespace
+    for (const token of connVal.split(',').map(t => t.trim()).filter(Boolean)) {
+      dynamicHopByHop.push(token.toLowerCase())
+    }
+  }
+
+  // Step 2: 删除固定 hop-by-hop 列表
+  const fixed = [
+    'keep-alive',
+    'proxy-connection',
+    'te',
+    'trailer',
+    'transfer-encoding'
+  ]
+
+  // 补丁2：请求侧不删除proxy-*头（上游可能需要）
+  if (!isRequest) {
+    fixed.push('proxy-authenticate', 'proxy-authorization')
+  }
+
+  // 补丁1：WebSocket/101响应时不删除upgrade和connection
+  if (!preserveUpgrade) {
+    fixed.push('connection', 'upgrade')
+  }
+
+  for (const name of fixed) {
+    headers.delete(name)
+  }
+
+  // Step 3: 删除 Connection 声明的动态字段
+  for (const name of dynamicHopByHop) {
+    // 补丁1：WebSocket时不删除upgrade
+    if (preserveUpgrade && (name === 'upgrade' || name === 'connection')) continue
+    headers.delete(name)
+  }
+
+  // Step 4: Connection 已在 Step 2 中删除（如果preserveUpgrade=false）
+}
+
 // --- KV-backed Dynamic Routing ---
 const ROUTE_POINTER_KEY = 'routes:current'
 const ROUTE_VERSION_KEY = (v) => `routes:${v}`
 const ROUTE_CACHE_KEY = 'routeCache'
+const ANON_HASH_CACHE_KEY = 'anonHash'
 
 if (!globalThis[ROUTE_CACHE_KEY]) {
   globalThis[ROUTE_CACHE_KEY] = { version: null, mappings: null, expiresAt: 0 }
+}
+
+if (!globalThis[ANON_HASH_CACHE_KEY]) {
+  globalThis[ANON_HASH_CACHE_KEY] = null
 }
 
 async function getPointerWithRetry(ns, maxRetries = 3) {
@@ -133,32 +202,45 @@ async function loadRouteMappings(env) {
   const cache = globalThis[ROUTE_CACHE_KEY]
 
   if (cache.mappings && cache.expiresAt > now) {
-    return { version: cache.version, mappings: cache.mappings }
+    return { version: cache.version, mappings: cache.mappings, kvReadMs: 0 }
   }
 
+  let kvReadMs = 0
   try {
+    const t0 = Date.now()
     const ptr = await getPointerWithRetry(env.ROUTE_MAP, 3)
+    kvReadMs += Date.now() - t0
+
     if (!ptr.version) {
+      // KV optimization: use shorter TTL for empty state (10s vs 60s)
       globalThis[ROUTE_CACHE_KEY] = {
         version: null,
         mappings: {},
-        expiresAt: now + CONFIG.ROUTE_CACHE_TTL * 1000
+        expiresAt: now + 10 * 1000
       }
-      return { version: null, mappings: {} }
+      return { version: null, mappings: {}, kvReadMs }
     }
 
+    const t1 = Date.now()
     const doc = await getVersionDocWithRetry(env.ROUTE_MAP, ptr.version, 3)
+    kvReadMs += Date.now() - t1
+
     globalThis[ROUTE_CACHE_KEY] = {
       version: doc.version,
       mappings: doc.mappings || {},
       expiresAt: now + CONFIG.ROUTE_CACHE_TTL * 1000
     }
-    return { version: doc.version, mappings: doc.mappings || {} }
+    return { version: doc.version, mappings: doc.mappings || {}, kvReadMs }
   } catch (error) {
+    // KV 读取失败时的降级策略
     if (cache.mappings) {
-      return { version: cache.version, mappings: cache.mappings }
+      // 保留过期缓存，继续服务（避免因 KV 短暂故障导致路由失效）
+      console.warn('[KV Fallback] Using stale cache due to KV error:', error.message)
+      return { version: cache.version, mappings: cache.mappings, kvReadMs }
     }
-    return { version: null, mappings: {} }
+    // 如果没有任何缓存，返回空路由表并使用默认上游（保持可用性）
+    console.error('[KV Fatal] No cached routes, using default upstream. KV error:', error.message)
+    return { version: null, mappings: {}, kvReadMs }
   }
 }
 
@@ -399,6 +481,17 @@ app.get('/manage', (c) => {
     let editingSubdomain = null;
     let selectedRoutes = new Set();
 
+    // HTML 转义函数（防止 XSS 攻击）
+    function escapeHtml(unsafe) {
+      if (typeof unsafe !== 'string') return '';
+      return unsafe
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
     function showToast(message, isError = false) {
       const toast = document.getElementById('toast');
       toast.textContent = message;
@@ -435,19 +528,25 @@ app.get('/manage', (c) => {
         if (entries.length === 0) {
           tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#A0A0A0;">暂无路由配置</td></tr>';
         } else {
-          tbody.innerHTML = entries.map(([sub, config]) => \`
-            <tr data-sub="\${sub}">
-              <td><input type="checkbox" class="route-check" value="\${sub}" onchange="updateSelectionState()"></td>
-              <td class="col-sub" data-label="子域名">\${sub}</td>
-              <td class="col-upstream" data-label="上游地址">\${config.upstream}</td>
+          tbody.innerHTML = entries.map(([sub, config]) => {
+            const escapedSub = escapeHtml(sub);
+            const escapedUpstream = escapeHtml(config.upstream);
+            const jsEscapedSub = sub.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
+            const jsEscapedUpstream = config.upstream.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
+            return \`
+            <tr data-sub="\${escapedSub}">
+              <td><input type="checkbox" class="route-check" value="\${escapedSub}" onchange="updateSelectionState()"></td>
+              <td class="col-sub" data-label="子域名">\${escapedSub}</td>
+              <td class="col-upstream" data-label="上游地址">\${escapedUpstream}</td>
               <td class="col-actions">
                 <div class="btn-group">
-                  <button class="btn-sm secondary" onclick="editRoute('\${sub}', '\${config.upstream}')">编辑</button>
-                  <button class="btn-sm danger" onclick="deleteRoute('\${sub}')">删除</button>
+                  <button class="btn-sm secondary" onclick="editRoute('\${jsEscapedSub}', '\${jsEscapedUpstream}')">编辑</button>
+                  <button class="btn-sm danger" onclick="deleteRoute('\${jsEscapedSub}')">删除</button>
                 </div>
               </td>
             </tr>
-          \`).join('');
+          \`;
+          }).join('');
         }
         const displayVersion = currentVersion
           ? 'v' + new Date(parseInt(currentVersion.slice(1))).toISOString().slice(0,16).replace('T',' ')
@@ -842,10 +941,10 @@ app.all('*', async (c) => {
   }
 
   // 动态路由：根据子域选择上游
-  const { version: routeVer, mappings } = await loadRouteMappings(c.env)
+  const { version: routeVer, mappings, kvReadMs: routeKvMs } = await loadRouteMappings(c.env)
   const subdomain = subdomainOf(url.hostname)
   const chosenMapping = mappings[subdomain] || mappings['default'] || null
-  const upstreamBase = mappingToBase(chosenMapping) || CONFIG.UPSTREAM_URL
+  const upstreamBase = mappingToBase(chosenMapping) || c.env.UPSTREAM_URL || CONFIG.UPSTREAM_URL
 
   // 强制使用 HTTPS 协议回源
   const targetUrl = new URL(url.pathname + url.search, upstreamBase)
@@ -863,28 +962,68 @@ app.all('*', async (c) => {
 
   // 仅缓冲关键非流式交互
   let reqBody = req.body
+  let canBufferBody = false
+
   if (!['GET', 'HEAD'].includes(req.method) && !url.pathname.includes('/Upload')) {
-    reqBody = await req.arrayBuffer()
-    proxyHeaders.delete('content-length')
+    const clHeader = req.headers.get('content-length')
+    const cl = clHeader ? parseInt(clHeader, 10) : NaN
+    const clValid = Number.isFinite(cl)
+    canBufferBody = clValid && cl <= CONFIG.MAX_BODY_BUFFER
+
+    if (canBufferBody) {
+      reqBody = await req.arrayBuffer()
+      proxyHeaders.delete('content-length')
+    } else {
+      reqBody = req.body
+    }
   }
 
   // --- 判别请求类型 ---
   const isStatic = CONFIG.STATIC_REGEX.test(url.pathname)
   const isVideo = CONFIG.VIDEO_REGEX.test(url.pathname)
   const isApiCacheable = CONFIG.API_CACHE_REGEX.test(url.pathname)
-  const isWebSocket = req.headers.get('Upgrade') === 'websocket'
+  const isWebSocket = (req.headers.get('Upgrade') || '').toLowerCase() === 'websocket'
   const isM3U8 = CONFIG.M3U8_REGEX.test(url.pathname)
   const isPlaybackInfo = CONFIG.PLAYBACKINFO_REGEX.test(url.pathname)
   const hasRange = !!req.headers.get('range')
   const isAndroidTV = CONFIG.ANDROID_TV_UA.test(req.headers.get('user-agent') || '')
-  const tokenHash = await buildTokenKey(req, url)
+
+  // RFC 7230: 清理 hop-by-hop 头（WebSocket除外）
+  if (!isWebSocket) {
+    cleanupHopByHopHeaders(proxyHeaders, false, true)
+  }
+
+  // Android TV：设置 keep-alive (skip for WebSocket to preserve Upgrade header)
+  if (isAndroidTV && !isWebSocket) {
+    proxyHeaders.set('Connection', 'keep-alive')
+  }
+
+  // CPU optimization: only compute hash when cache key needed (whitelisted paths)
+  // For static resources, skip hash if no token hint (avoid wasting CPU on anonymous requests)
+  const hasTokenHint = req.headers.has('X-Emby-Token') ||
+                       req.headers.has('X-MediaBrowser-Token') ||
+                       url.searchParams.has('api_key') ||
+                       req.headers.has('Authorization') ||
+                       req.headers.has('X-Emby-Authorization')
+
+  const needsCacheKey = !isVideo && !hasRange && (isM3U8 || isPlaybackInfo || isApiCacheable || (isStatic && hasTokenHint))
+  const tokenHash = needsCacheKey ? await buildTokenKey(req, url) : null
+
+  // 检查是否有有效 token（防止匿名用户缓存泄露）
+  // CPU optimization: cache 'anon:nodev' hash to avoid recalculation
+  if (!globalThis[ANON_HASH_CACHE_KEY]) {
+    globalThis[ANON_HASH_CACHE_KEY] = await sha256Hex('anon:nodev')
+  }
+  // Note: hasToken will be false when tokenHash is null (hash skipped for media/range/anonymous static)
+  // This is intentional - requests without cache keys should not trigger caching logic
+  const hasToken = tokenHash && tokenHash !== globalThis[ANON_HASH_CACHE_KEY]
 
   // --- Cloudflare 策略配置 ---
   const cfConfig = {
-    // 1. 静态图片：强力缓存 1 年
-    cacheEverything: isStatic,
-    cacheTtl: isStatic ? 31536000 : 0,
-    
+    // 1. 静态图片：强力缓存 1 年（仅对已认证用户，防止跨用户泄露）
+    cacheEverything: isStatic && hasToken,
+    cacheTtl: (isStatic && hasToken) ? 31536000 : 0,
+
     // 2. API 微缓存：缓存 10 秒 (解决 Resume 接口慢的问题)
     // 注意：只有 GET 请求才会生效 cacheTtl
     cacheTtlByStatus: isApiCacheable ? { "200-299": 10 } : null,
@@ -894,15 +1033,19 @@ app.all('*', async (c) => {
     // 视频资源：彻底关闭所有处理 (off)
     polish: isStatic ? 'lossy' : 'off',
     minify: { javascript: isStatic, css: isStatic, html: isStatic },
-    
+
     // 4. 视频流核心：关闭缓冲
     mirage: false,
     scrapeShield: false,
     apps: false,
   }
 
-  // 检查是否有有效 token（防止匿名用户缓存泄露）
-  const hasToken = tokenHash !== await sha256Hex('anon:nodev')
+  // 静态资源缓存键隔离（防止跨用户泄露）
+  if (isStatic && hasToken) {
+    const keyUrl = new URL(targetUrl)
+    if (keyUrl.searchParams.sort) keyUrl.searchParams.sort()
+    cfConfig.cacheKey = `${keyUrl.pathname}?${keyUrl.searchParams.toString()}::${tokenHash}`
+  }
 
   // 如果是 API 微缓存，也需要开启 cacheEverything 才能生效
   if (isApiCacheable && hasToken) {
@@ -934,81 +1077,156 @@ app.all('*', async (c) => {
     headers: proxyHeaders,
     body: reqBody,
     redirect: 'manual',
-    cf: cfConfig
+    cf: { ...cfConfig }
   }
+
+  // DEBUG mode: performance metrics (enabled via env.DEBUG)
+  const DEBUG = c.env?.DEBUG === 'true' || c.env?.DEBUG === '1'
+  const kind = isVideo ? 'media' : (hasRange ? 'range' : (isM3U8 ? 'm3u8' : (isPlaybackInfo ? 'playbackinfo' : 'api')))
+  let kvReadMs = routeKvMs || 0
+  let upstreamMs = 0
+  let retryCount = 0
+  let subreqCount = 0
+  let cacheHit = 0
 
   try {
     let response;
 
-    // Android TV：设置 keep-alive
-    if (isAndroidTV) {
+    // Android TV：设置 keep-alive (skip for WebSocket to preserve Upgrade header)
+    if (isAndroidTV && !isWebSocket) {
       proxyHeaders.set('Connection', 'keep-alive')
     }
 
     // PlaybackInfo POST 微缓存（caches.default）
-    if (isPlaybackInfo && req.method === 'POST' && !hasRange) {
+    if (isPlaybackInfo && req.method === 'POST' && !hasRange && canBufferBody) {
       const bodyHash = await sha256Hex(reqBody || '')
-      const cacheKey = `https://cache.playbackinfo.local${url.pathname}?${url.searchParams}&h=${tokenHash}&b=${bodyHash}`
+      // Stable cache key: manually sort query parameters
+      const sortedParams = Array.from(url.searchParams.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => `${k}=${v}`)
+        .join('&')
+      const cacheKey = `https://cache.playbackinfo.local${url.pathname}?${sortedParams}&h=${tokenHash}&b=${bodyHash}`
       const cacheReq = new Request(cacheKey, { method: 'GET' })
       const cache = caches.default
       const cached = await cache.match(cacheReq)
       if (cached) {
+        cacheHit = 1
         return new Response(cached.body, { status: cached.status, headers: cached.headers })
       }
 
-      const timeout = isAndroidTV ? CONFIG.ANDROID_API_TIMEOUT : CONFIG.API_TIMEOUT
-      let upstreamResp
-      try {
-        upstreamResp = await fetchWithTimeout(targetUrl.toString(), fetchOptions, timeout)
-      } catch {
-        upstreamResp = await fetch(targetUrl.toString(), fetchOptions)
-      }
+      // Critical path: bounded timeout, no retry
+      const t0 = Date.now()
+      subreqCount++
+      const upstreamResp = await fetchWithTimeout(targetUrl.toString(), fetchOptions, CONFIG.CRITICAL_TIMEOUT)
+      upstreamMs += Date.now() - t0
 
       const resHeaders = new Headers(upstreamResp.headers)
+
+      // 清理hop-by-hop头（PlaybackInfo不会是101响应）
+      cleanupHopByHopHeaders(resHeaders, false, false)
+
       if (upstreamResp.ok && (resHeaders.get('content-type') || '').includes('application/json')) {
-        resHeaders.set('Cache-Control', `public, max-age=${CONFIG.PLAYBACKINFO_TTL}`)
+        resHeaders.set('Cache-Control', `private, max-age=${CONFIG.PLAYBACKINFO_TTL}`)
         const toStore = new Response(upstreamResp.body, { status: upstreamResp.status, headers: resHeaders })
+
         c.executionCtx.waitUntil(caches.default.put(cacheReq, toStore.clone()))
         response = toStore
       } else {
         response = upstreamResp
       }
-    } else if (isVideo || isWebSocket || (req.method === 'POST' && !(isPlaybackInfo && !hasRange))) {
-      // 视频流 & Socket & 非 PlaybackInfo 的 POST -> 直连 (无超时，无重试)
-      response = await fetch(targetUrl.toString(), fetchOptions)
-    } else {
-      // API & 图片 -> 带超时重试（Android TV 放宽）
-      const timeout = isAndroidTV ? CONFIG.ANDROID_API_TIMEOUT : CONFIG.API_TIMEOUT
-      try {
-        response = await fetchWithTimeout(targetUrl.toString(), fetchOptions, timeout)
-      } catch (err) {
+    }
+
+    if (!response) {
+      // 媒体请求处理分支
+      if ((isVideo || hasRange) && !isWebSocket) {
+        // Media/Range: direct passthrough (no timeout/retry)
+        const t0 = Date.now()
+        subreqCount++
         response = await fetch(targetUrl.toString(), fetchOptions)
+        upstreamMs += Date.now() - t0
+      } else if (isWebSocket || (req.method === 'POST' && !(isPlaybackInfo && !hasRange))) {
+        // WebSocket or other POST: direct passthrough (no timeout)
+        const t0 = Date.now()
+        subreqCount++
+        response = await fetch(targetUrl.toString(), fetchOptions)
+        upstreamMs += Date.now() - t0
+      } else {
+        // 其他请求：区分关键路径和非关键路径
+        const isCriticalPath = (isM3U8 && req.method === 'GET') || (isApiCacheable && req.method === 'GET') || (isPlaybackInfo && req.method === 'POST')
+
+        if (isCriticalPath) {
+          // Critical path: bounded timeout, no retry
+          const t0 = Date.now()
+          subreqCount++
+          response = await fetchWithTimeout(targetUrl.toString(), fetchOptions, CONFIG.CRITICAL_TIMEOUT)
+          upstreamMs += Date.now() - t0
+        } else {
+          // Non-critical: keep timeout, but no retry
+          const timeout = isAndroidTV ? CONFIG.ANDROID_API_TIMEOUT : CONFIG.API_TIMEOUT
+          const t0 = Date.now()
+          subreqCount++
+          response = await fetchWithTimeout(targetUrl.toString(), fetchOptions, timeout)
+          upstreamMs += Date.now() - t0
+        }
       }
     }
 
+
+
+
     // --- 响应处理 ---
     const resHeaders = new Headers(response.headers)
+
+    // RFC 7230: 清理 hop-by-hop 头（101响应除外）
+    if (response.status !== 101) {
+      cleanupHopByHopHeaders(resHeaders, false, false)
+    }
+
     resHeaders.delete('content-security-policy')
     resHeaders.delete('clear-site-data')
     resHeaders.set('access-control-allow-origin', '*')
 
-    // [关键] 视频流连接策略：Android TV 使用 keep-alive，其他使用 close
-    if (isVideo) {
-      if (isAndroidTV) {
-        resHeaders.set('Connection', 'keep-alive')
-        resHeaders.set('Keep-Alive', 'timeout=30, max=1000')
-      } else {
-        resHeaders.set('Connection', 'close')
-      }
+    // Connection optimization: Android TV uses keep-alive, others allow reuse (no forced close)
+    if (isVideo && isAndroidTV) {
+      resHeaders.set('Connection', 'keep-alive')
+      resHeaders.set('Keep-Alive', 'timeout=30, max=1000')
     }
-    
-    // [补充] 强制静态图片缓存命中
+
+    // m3u8 Cache-Control Strategy: Use private to prevent client-side/intermediate cache issues
+    if (isM3U8 && response.ok) {
+      resHeaders.set('Cache-Control', `private, max-age=${CONFIG.M3U8_TTL}`)
+    }
+
+    // [补充] 强制静态图片缓存命中（仅对已认证用户，防止跨用户泄露）
     // Emby 有时会返回 private 或 no-cache 头，导致 CF 即使配置了 cacheEverything 也不缓存
     // 我们强制覆盖这些头
     if (isStatic && response.status === 200) {
-        resHeaders.set('Cache-Control', 'public, max-age=31536000, immutable')
-        resHeaders.delete('Pragma')
-        resHeaders.delete('Expires')
+        if (hasToken) {
+            // 已认证用户：启用长期缓存
+            resHeaders.set('Cache-Control', 'public, max-age=31536000, immutable')
+            resHeaders.delete('Pragma')
+            resHeaders.delete('Expires')
+        } else {
+            // 匿名用户：禁用缓存，防止跨用户泄露
+            resHeaders.set('Cache-Control', 'no-store, no-cache, must-revalidate')
+            resHeaders.set('Pragma', 'no-cache')
+            resHeaders.set('Expires', '0')
+        }
+    }
+
+    // DEBUG: Server-Timing header
+    if (DEBUG) {
+      const timing = [
+        `kind;desc="${kind}"`,
+        `kv_read;dur=${kvReadMs}`,
+        `cache_hit;desc="${cacheHit}"`,
+        `upstream;dur=${upstreamMs}`,
+        `retry;desc="${retryCount}"`,
+        `subreq;desc="${subreqCount}"`
+      ].join(', ');
+      resHeaders.set('Server-Timing', timing);
+      // 将性能信息和请求路径一起打印到日志中
+      console.log(`[PERF] ${req.method} ${url.pathname} | Status: ${response.status} | ${timing}`);
     }
 
     if (response.status === 101) {

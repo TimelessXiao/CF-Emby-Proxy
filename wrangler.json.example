@@ -13,6 +13,10 @@
       "preview_id": "REPLACE_WITH_YOUR_PREVIEW_NAMESPACE_ID"
     }
   ],
+  "vars": {
+    "UPSTREAM_URL": "https://your-emby-server.com",
+    "DEBUG": "false"
+  },
   "observability": {
     "enabled": false,
     "head_sampling_rate": 1,
