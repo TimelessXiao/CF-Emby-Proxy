@@ -11,3 +11,4 @@ wrangler.json
 wrangler.toml
 .npmrc
 .netrc
+.idea/
