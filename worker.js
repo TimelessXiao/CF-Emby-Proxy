@@ -17,12 +17,11 @@ const CONFIG = {
   API_CACHE_BYPASS_REGEX: /SortBy=Random/i,
 
   // API超时设置
-  API_TIMEOUT: 4500,
+  API_TIMEOUT: 6000,
   CRITICAL_TIMEOUT: 9000,
 
-  // Android TV/ExoPlayer 识别
-  ANDROID_TV_UA: /(ExoPlayer|AFT|BRAVIA|MiTV|SHIELD|GoogleTV|FireTV|Chromecast|Android TV)/i,
-  ANDROID_API_TIMEOUT: 6000,
+  // hop-by-hop keep-alive 注入开关（默认关闭，安全优先）
+  ENABLE_HOP_BY_HOP_KEEPALIVE: false,
 
   // 播放清单与播放信息微缓存
   M3U8_REGEX: /\.m3u8($|\?)/i,
@@ -34,8 +33,39 @@ const CONFIG = {
   MAX_BODY_BUFFER: 262144,
 
   // 路由表内存缓存 TTL（秒）
-  ROUTE_CACHE_TTL: 60
+  ROUTE_CACHE_TTL: 60,
+
+  // [阶段1-P0] 媒体/Range 请求首包超时配置
+  MEDIA_TTFB_TIMEOUT_MS: 8000,        // 首包超时 8s
+  MEDIA_TTFB_RETRY_MAX: 1,            // 最多重试 1 次
+  MEDIA_TTFB_RETRY_BACKOFF_MIN_MS: 100,  // 重试延迟最小值
+  MEDIA_TTFB_RETRY_BACKOFF_MAX_MS: 200,  // 重试延迟最大值
+
+  // [阶段2-P0] 空 tag 图片短 TTL 缓存配置
+  EMPTY_TAG_IMAGE_TTL_S: 90,          // 空 tag 匿名图片边缘缓存 TTL（秒）
+
+  // [阶段4-P1] DEBUG 采样率（防止 header 膨胀）
+  DEBUG_SAMPLE_RATE: 0.1              // 采样 10% 的请求用于 DEBUG 输出
 }
+
+// 播放器/客户端标识（用于 UA 分类与诊断，小写）
+const PLAYER_TOKENS = [
+  'afusekt',      // Infuse variant
+  'exoplayer',    // Android native players
+  'mpv',          // Desktop player
+  'hills',        // Desktop player
+  'infuse',       // iOS/tvOS player
+  'emby',         // Official Emby apps
+  'jellyfin',     // Jellyfin apps
+  'roku',         // Roku platform
+  'android tv',   // Android TV platform (组合词，避免误判 Android 浏览器)
+  'firetv',       // Amazon Fire TV
+  'google tv',    // Google TV platform
+  'chromecast',   // Chromecast
+  'shield',       // NVIDIA Shield
+  'bravia',       // Sony TV
+  'mitv'          // Xiaomi TV
+]
 
 // [P0-3] Cache Key 去噪白名单（扩展版）
 const CACHE_QUERY_ALLOWLIST = new Set([
@@ -55,6 +85,13 @@ const app = new Hono()
 
 // --- Utility Functions ---
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+function getPlayerHint(ua) {
+  if (!ua) return null
+  const uaLower = ua.toLowerCase()
+  const hit = PLAYER_TOKENS.find((token) => uaLower.includes(token))
+  return hit || null
+}
 
 async function sha256Hex(input) {
   let data
@@ -336,6 +373,66 @@ async function fetchWithTimeout(url, options, timeout) {
     clearTimeout(id);
     throw error;
   }
+}
+
+// [阶段1-P0] 首包（TTFB）超时包装器：仅对"收到 response headers"阶段设置超时
+async function fetchWithTtfbTimeout(url, options, ttfbMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ttfbMs);
+
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timer);
+    return response;
+  } catch (error) {
+    clearTimeout(timer);
+    throw error;
+  }
+}
+
+// [阶段1-P0] 首包超时 + 单次重试包装器：仅在 headers 接收超时时重试
+async function fetchWithTtfbTimeoutAndRetry(url, options, ttfbMs, retryMax, backoffMinMs, backoffMaxMs) {
+  let lastError
+
+  for (let attempt = 0; attempt <= retryMax; attempt++) {
+    try {
+      if (attempt > 0) {
+        const jitter = backoffMinMs + Math.random() * (backoffMaxMs - backoffMinMs)
+        await sleep(jitter)
+      }
+
+      return await fetchWithTtfbTimeout(url, options, ttfbMs)
+    } catch (error) {
+      lastError = error
+      const isAbort = error.name === 'AbortError'
+      if (!isAbort || attempt >= retryMax) {
+        throw error
+      }
+    }
+  }
+
+  throw lastError
+}
+
+// [阶段2-P0] 检测是否为匿名图片请求（无认证令牌）
+function isAnonymousImageRequest(req, url) {
+  const hasAuthHeader = req.headers.has('Authorization') ||
+                        req.headers.has('X-Emby-Authorization') ||
+                        req.headers.has('X-Emby-Token') ||
+                        req.headers.has('X-MediaBrowser-Token') ||
+                        req.headers.has('Cookie')  // [优化-P0] 防止 session/cookie auth 泄露
+  const hasAuthParam = url.searchParams.has('api_key') ||
+                       url.searchParams.has('X-Emby-Token') ||
+                       url.searchParams.has('X-MediaBrowser-Token')
+  return !hasAuthHeader && !hasAuthParam
+}
+
+// [阶段2-P0] 检测是否为空 tag Artwork 请求（用于短 TTL 缓存）
+function isEmptyTagArtwork(url) {
+  const isImagePath = /\/Items\/[^\/]+\/Images\/[^\/]+/i.test(url.pathname)
+  const notUserPath = !/\/(Users|Persons)\//i.test(url.pathname)
+  const hasEmptyTag = !url.searchParams.get('tag')
+  return isImagePath && notUserPath && hasEmptyTag
 }
 
 // --- /manage Management Endpoints ---
@@ -802,7 +899,8 @@ app.all('*', async (c) => {
   const isM3U8 = CONFIG.M3U8_REGEX.test(url.pathname)
   const isPlaybackInfo = CONFIG.PLAYBACKINFO_REGEX.test(url.pathname)
   const hasRange = !!req.headers.get('range')
-  const isAndroidTV = CONFIG.ANDROID_TV_UA.test(req.headers.get('user-agent') || '')
+  const ua = req.headers.get('user-agent') || ''
+  const playerHint = getPlayerHint(ua)
 
   // 匿名图片缓存：仅对带有效 tag 参数的 Items 图片路径启用（大小写不敏感）
   const tagParam = url.searchParams.get('tag') || ''
@@ -816,8 +914,19 @@ app.all('*', async (c) => {
     cleanupHopByHopHeaders(proxyHeaders, false, true)
   }
 
-  if (isAndroidTV && !isWebSocket) {
-    proxyHeaders.set('Connection', 'keep-alive')
+  // [阶段1-P0] Range 请求强制 identity 编码，避免 Range + gzip 导致的中间层异常
+  if (hasRange) {
+    proxyHeaders.set('Accept-Encoding', 'identity')
+  }
+
+  // HTTP/2 协议检测（RFC 7540：HTTP/2 禁止 hop-by-hop 头）
+  const isHttp2 = req.cf?.httpProtocol === 'HTTP/2' || req.cf?.httpProtocol === 'HTTP/3'
+
+  // Browser playback is out of scope
+  if (CONFIG.ENABLE_HOP_BY_HOP_KEEPALIVE && !isWebSocket && !isHttp2) {
+    if (!proxyHeaders.has('Connection')) {
+      proxyHeaders.set('Connection', 'keep-alive')
+    }
   }
 
   // [P0-4] Token Hint 逻辑更新：检查 Query Params
@@ -860,6 +969,18 @@ app.all('*', async (c) => {
     cfConfig.cacheEverything = true
     cfConfig.cacheTtl = 0
     cfConfig.cacheTtlByStatus = { "200-299": 31536000 }
+  }
+
+  // [阶段2-P0] 空 tag 匿名图片短 TTL 缓存（抗抖动，减少切集时 500 错误）
+  const isEmptyTag = isStatic && isEmptyTagArtwork(url) && isAnonymousImageRequest(req, url)
+  if (isEmptyTag && req.method === 'GET') {
+    const keyUrl = new URL(targetUrl)
+    if (keyUrl.searchParams.sort) keyUrl.searchParams.sort()
+
+    cfConfig.cacheEverything = true
+    cfConfig.cacheTtl = 0
+    cfConfig.cacheTtlByStatus = { "200-299": CONFIG.EMPTY_TAG_IMAGE_TTL_S }
+    cfConfig.cacheKey = `${url.hostname}::${keyUrl.pathname}?${keyUrl.searchParams.toString()}`
   }
 
   // [P0-3] API 微缓存 De-noising (基于白名单构建 CacheKey)
@@ -947,9 +1068,38 @@ app.all('*', async (c) => {
 
     if (!response) {
       if ((isVideo || hasRange) && !isWebSocket) {
+        // [阶段1-P0] 使用 TTFB 超时+单次重试机制，避免长时间 0.0kb/s 挂起
         const t0 = Date.now()
         subreqCount++
-        response = await fetch(targetUrl.toString(), fetchOptions)
+        let retryAttempt = 0
+        try {
+          for (let attempt = 0; attempt <= CONFIG.MEDIA_TTFB_RETRY_MAX; attempt++) {
+            try {
+              if (attempt > 0) {
+                const jitter = CONFIG.MEDIA_TTFB_RETRY_BACKOFF_MIN_MS +
+                               Math.random() * (CONFIG.MEDIA_TTFB_RETRY_BACKOFF_MAX_MS - CONFIG.MEDIA_TTFB_RETRY_BACKOFF_MIN_MS)
+                await sleep(jitter)
+                retryAttempt = attempt
+              }
+
+              response = await fetchWithTtfbTimeout(
+                targetUrl.toString(),
+                fetchOptions,
+                CONFIG.MEDIA_TTFB_TIMEOUT_MS
+              )
+              break
+            } catch (error) {
+              if (error.name === 'AbortError' && attempt < CONFIG.MEDIA_TTFB_RETRY_MAX) {
+                continue
+              }
+              throw error
+            }
+          }
+        } catch (error) {
+          retryCount = retryAttempt
+          throw error
+        }
+        retryCount = retryAttempt
         upstreamMs += Date.now() - t0
       } else if (isWebSocket || (req.method === 'POST' && !(isPlaybackInfo && !hasRange))) {
         const t0 = Date.now()
@@ -966,7 +1116,8 @@ app.all('*', async (c) => {
           response = await fetchWithTimeout(targetUrl.toString(), fetchOptions, CONFIG.CRITICAL_TIMEOUT)
           upstreamMs += Date.now() - t0
         } else {
-          const timeout = isAndroidTV ? CONFIG.ANDROID_API_TIMEOUT : CONFIG.API_TIMEOUT
+          // Browser playback is out of scope
+          const timeout = CONFIG.API_TIMEOUT
           const t0 = Date.now()
           subreqCount++
           response = await fetchWithTimeout(targetUrl.toString(), fetchOptions, timeout)
@@ -985,9 +1136,14 @@ app.all('*', async (c) => {
     resHeaders.delete('clear-site-data')
     resHeaders.set('access-control-allow-origin', '*')
 
-    if (isVideo && isAndroidTV) {
-      resHeaders.set('Connection', 'keep-alive')
-      resHeaders.set('Keep-Alive', 'timeout=30, max=1000')
+    // Browser playback is out of scope
+    if (CONFIG.ENABLE_HOP_BY_HOP_KEEPALIVE && isVideo && !isWebSocket && !isHttp2) {
+      if (!resHeaders.has('Connection')) {
+        resHeaders.set('Connection', 'keep-alive')
+      }
+      if (!resHeaders.has('Keep-Alive')) {
+        resHeaders.set('Keep-Alive', 'timeout=30, max=1000')
+      }
     }
 
     if (isM3U8 && response.ok) {
@@ -997,6 +1153,11 @@ app.all('*', async (c) => {
     if (isStatic && response.status === 200) {
         if (hasToken || isTaggedArtwork) {
             resHeaders.set('Cache-Control', 'public, max-age=31536000, immutable')
+            resHeaders.delete('Pragma')
+            resHeaders.delete('Expires')
+        } else if (isEmptyTag) {
+            // [阶段2-P0] 空 tag 匿名图片短 TTL 缓存响应头
+            resHeaders.set('Cache-Control', `public, max-age=0, s-maxage=${CONFIG.EMPTY_TAG_IMAGE_TTL_S}`)
             resHeaders.delete('Pragma')
             resHeaders.delete('Expires')
         } else {
@@ -1013,16 +1174,24 @@ app.all('*', async (c) => {
     }
 
     if (DEBUG) {
-      const timing = [
-        `kind;desc="${kind}"`,
-        `kv_read;dur=${kvReadMs}`,
-        `cache_hit;desc="${cacheHit}"`,
-        `upstream;dur=${upstreamMs}`,
-        `retry;desc="${retryCount}"`,
-        `subreq;desc="${subreqCount}"`
-      ].join(', ');
-      resHeaders.set('Server-Timing', timing);
-      console.log(`[PERF] ${req.method} ${url.pathname} | Status: ${response.status} | ${timing}`);
+      // [阶段4-P1] DEBUG 采样控制 + 增强 Server-Timing 字段
+      const shouldSample = Math.random() < CONFIG.DEBUG_SAMPLE_RATE
+      if (shouldSample || (isVideo || hasRange)) {  // 媒体请求始终记录
+        const clientClass = 'client'
+        const playerClass = playerHint || 'na'
+        const timing = [
+          `kind;desc="${kind}"`,
+          `client;desc="${clientClass}"`,
+          `player_hint;desc="${playerClass}"`,
+          `kv_read;dur=${kvReadMs}`,
+          `cache_hit;desc="${cacheHit}"`,
+          `upstream;dur=${upstreamMs}`,
+          `retry;desc="${retryCount}"`,
+          `subreq;desc="${subreqCount}"`
+        ].join(', ');
+        resHeaders.set('Server-Timing', timing);
+        console.log(`[PERF] ${req.method} ${url.pathname} | Status: ${response.status} | ${timing}`);
+      }
     }
 
     if (response.status === 101) {
@@ -1040,6 +1209,26 @@ app.all('*', async (c) => {
         return new Response(null, { status: response.status, headers: resHeaders })
     }
 
+    // [优化-P0] 图片 5xx 降级：返回 1x1 透明 PNG，避免 UI 破损图标
+    if (isStatic && response.status >= 500 && /\/Images\//i.test(url.pathname)) {
+      const transparentPixel = new Uint8Array([
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+        0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+        0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82
+      ])
+      return new Response(transparentPixel.buffer, {
+        status: 200,
+        headers: new Headers({
+          'Content-Type': 'image/png',
+          'Cache-Control': 'no-store',
+          'Content-Length': transparentPixel.length.toString()
+        })
+      })
+    }
+
     return new Response(response.body, {
       status: response.status,
       headers: resHeaders
@@ -1050,11 +1239,12 @@ app.all('*', async (c) => {
     const isTimeout = error.name === 'AbortError' || error.message === 'Timeout' || (error.code === 23); // 23 is Cloudflare-specific generic timeout code sometimes
     const status = isTimeout ? 504 : 502
     const statusText = isTimeout ? 'Gateway Timeout' : 'Bad Gateway'
-    
-    // 增加诊断 Header
+
+    // [优化-P0] 增加诊断 Header：对于视频/Range 使用正确的 TTFB 超时值
     const errorHeaders = new Headers({ 'Content-Type': 'application/json' })
     if (DEBUG) {
-      errorHeaders.set('X-Proxy-Error', isTimeout ? `Timeout-${CONFIG.CRITICAL_TIMEOUT}ms` : `Upstream-${error.message}`)
+      const timeoutMs = (isVideo || hasRange) ? CONFIG.MEDIA_TTFB_TIMEOUT_MS : CONFIG.CRITICAL_TIMEOUT
+      errorHeaders.set('X-Proxy-Error', isTimeout ? `Timeout-${timeoutMs}ms` : `Upstream-${error.message}`)
     }
 
     const message = DEBUG ? `Proxy Error: ${error?.message || String(error)}` : statusText
