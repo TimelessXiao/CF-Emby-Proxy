@@ -11,9 +11,10 @@ const CONFIG = {
   // 视频流 (直连，不缓存，不重试)
   VIDEO_REGEX: /(\/Videos\/|\/Items\/.*\/Download|\/Items\/.*\/Stream)/i,
 
-  // [新增] 慢接口微缓存 (解决 Resume 1.5s 的问题)
-  // 缓存 API 响应 5-10秒，大幅提升"返回/进入"页面的流畅度，同时不影响数据准确性
-  API_CACHE_REGEX: /(\/Items\/Resume|\/Users\/.*\/Items\/)/i,
+  // [P0-1 & P0-2] 慢接口微缓存 (解决 Resume 1.5s 的问题 + 库核心接口)
+  // 扩展覆盖 /Items 列表接口，但排除下载、流式传输、图片路径
+  API_CACHE_REGEX: /(\/Items(?!\/.*\/Download|\/.*\/Stream|\/.*\/Images)|\/Items\/Resume|\/Users\/.*\/Items\/Latest|\/Users\/.*\/Views|\/Shows\/NextUp)/i,
+  API_CACHE_BYPASS_REGEX: /SortBy=Random/i,
 
   // API超时设置
   API_TIMEOUT: 4500,
@@ -35,6 +36,20 @@ const CONFIG = {
   // 路由表内存缓存 TTL（秒）
   ROUTE_CACHE_TTL: 60
 }
+
+// [P0-3] Cache Key 去噪白名单（扩展版）
+const CACHE_QUERY_ALLOWLIST = new Set([
+  'UserId', 'ParentId', 'Id', 'Ids', 'Limit', 'StartIndex',
+  'SortBy', 'SortOrder', 'IncludeItemTypes', 'ExcludeItemTypes',
+  'Recursive', 'Filters', 'Fields', 'ImageType',
+  'EnableImageEnhancers', 'MinDateLastSaved',
+  'EnableImages', 'EnableTotalRecordCount', 'ImageTypeLimit',
+  'CollapseBoxSetItems', 'IsMissing', 'IsUnaired'
+]);
+
+// Tag 参数校验正则（用于匿名图片缓存）
+const TAG_HEX_REGEX = /^[a-f0-9]{8,128}$/i
+const TAG_BASE64URL_REGEX = /^[A-Za-z0-9_-]{8,128}$/
 
 const app = new Hono()
 
@@ -63,9 +78,12 @@ async function buildTokenKey(req, url) {
   const headers = req.headers
   const params = url.searchParams
 
+  // [P0-4] 支持 Query Token (X-Emby-Token / X-MediaBrowser-Token)
   let token = headers.get('X-Emby-Token') ||
               headers.get('X-MediaBrowser-Token') ||
               params.get('api_key') ||
+              params.get('X-Emby-Token') ||
+              params.get('X-MediaBrowser-Token') ||
               null
 
   const auth = headers.get('Authorization') || headers.get('X-Emby-Authorization') || ''
@@ -86,39 +104,60 @@ async function buildTokenKey(req, url) {
     if (deviceMatch) deviceId = deviceMatch[1]
   }
 
+  // 安全：仅在有真实 token 时使用 token 作为缓存键的一部分
+  // 如果仅有 deviceId 而无 token，视为匿名请求
   const tokenPart = token || 'anon'
   const devicePart = deviceId || 'nodev'
-  return sha256Hex(`${tokenPart}:${devicePart}`)
+  const hash = await sha256Hex(`${tokenPart}:${devicePart}`)
+
+  // 返回 hash 和 token 存在性信息
+  return { hash, hasRealToken: !!token }
+}
+
+async function readBodyWithLimit(req, maxBytes) {
+  const reader = req.body?.getReader()
+  if (!reader) return { buf: null, truncated: false }
+
+  const chunks = []
+  let totalBytes = 0
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      totalBytes += value.byteLength
+      if (totalBytes > maxBytes) {
+        await reader.cancel()
+        return { buf: null, truncated: true }
+      }
+      chunks.push(value)
+    }
+
+    const merged = new Uint8Array(totalBytes)
+    let offset = 0
+    for (const chunk of chunks) {
+      merged.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return { buf: merged.buffer, truncated: false }
+  } catch (error) {
+    return { buf: null, truncated: true }
+  }
 }
 
 // RFC 7230 hop-by-hop header cleanup (CORRECT ORDER + WebSocket Protection)
-//
-// 正确顺序（关键）：
-// 1. 先读取 Connection 的值（如果存在）并解析 token
-// 2. 再删除固定 hop-by-hop 列表
-// 3. 再删除解析出来的 token 字段名
-// 4. 最后删除 Connection 本身
-//
-// 参数：
-// - headers: Headers对象
-// - preserveUpgrade: 是否保留Upgrade头（WebSocket/101响应时为true）
-//   修正F：当前调用策略下，此参数基本不会生效（WS请求侧不调用、101响应侧不调用）
-//   保留此参数仅用于将来可能出现的非标准场景，避免实现者误用
-// - isRequest: 是否为请求侧（请求侧不删除proxy-*头）
 function cleanupHopByHopHeaders(headers, preserveUpgrade = false, isRequest = false) {
   if (!headers) return
 
-  // Step 1: 先读取并解析 Connection 头的值（在删除之前！）
   const connVal = headers.get('Connection') || headers.get('connection')
   const dynamicHopByHop = []
   if (connVal) {
-    // Parse comma-separated field-names; case-insensitive; trim whitespace
     for (const token of connVal.split(',').map(t => t.trim()).filter(Boolean)) {
       dynamicHopByHop.push(token.toLowerCase())
     }
   }
 
-  // Step 2: 删除固定 hop-by-hop 列表
   const fixed = [
     'keep-alive',
     'proxy-connection',
@@ -127,12 +166,10 @@ function cleanupHopByHopHeaders(headers, preserveUpgrade = false, isRequest = fa
     'transfer-encoding'
   ]
 
-  // 补丁2：请求侧不删除proxy-*头（上游可能需要）
   if (!isRequest) {
     fixed.push('proxy-authenticate', 'proxy-authorization')
   }
 
-  // 补丁1：WebSocket/101响应时不删除upgrade和connection
   if (!preserveUpgrade) {
     fixed.push('connection', 'upgrade')
   }
@@ -141,14 +178,10 @@ function cleanupHopByHopHeaders(headers, preserveUpgrade = false, isRequest = fa
     headers.delete(name)
   }
 
-  // Step 3: 删除 Connection 声明的动态字段
   for (const name of dynamicHopByHop) {
-    // 补丁1：WebSocket时不删除upgrade
     if (preserveUpgrade && (name === 'upgrade' || name === 'connection')) continue
     headers.delete(name)
   }
-
-  // Step 4: Connection 已在 Step 2 中删除（如果preserveUpgrade=false）
 }
 
 // --- KV-backed Dynamic Routing ---
@@ -212,7 +245,6 @@ async function loadRouteMappings(env) {
     kvReadMs += Date.now() - t0
 
     if (!ptr.version) {
-      // KV optimization: use shorter TTL for empty state (10s vs 60s)
       globalThis[ROUTE_CACHE_KEY] = {
         version: null,
         mappings: {},
@@ -232,13 +264,10 @@ async function loadRouteMappings(env) {
     }
     return { version: doc.version, mappings: doc.mappings || {}, kvReadMs }
   } catch (error) {
-    // KV 读取失败时的降级策略
     if (cache.mappings) {
-      // 保留过期缓存，继续服务（避免因 KV 短暂故障导致路由失效）
       console.warn('[KV Fallback] Using stale cache due to KV error:', error.message)
       return { version: cache.version, mappings: cache.mappings, kvReadMs }
     }
-    // 如果没有任何缓存，返回空路由表并使用默认上游（保持可用性）
     console.error('[KV Fatal] No cached routes, using default upstream. KV error:', error.message)
     return { version: null, mappings: {}, kvReadMs }
   }
@@ -358,11 +387,7 @@ app.get('/manage', (c) => {
     #toast { position: fixed; top: 20px; right: 20px; background: #52B54B; color: white; padding: 16px 20px; border-radius: 4px; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
     #toast.error { background: #E53935; }
     .loading { opacity: 0.6; pointer-events: none; }
-
-    /* 复选框样式 */
     input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; accent-color: #52B54B; }
-
-    /* 批量操作栏 */
     .bulk-bar {
       position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
       background: #333; border: 1px solid #52B54B;
@@ -373,49 +398,18 @@ app.get('/manage', (c) => {
     }
     @keyframes slideUp { from { transform: translate(-50%, 100%); } to { transform: translate(-50%, 0); } }
     .bulk-bar span { color: #E0E0E0; font-size: 14px; }
-
-    /* 选中行高亮 */
     tr.selected { background: #252525 !important; border-left: 3px solid #52B54B; }
-
     @media (max-width: 768px) {
-      /* 隐藏表头 */
       thead { display: none; }
-
-      /* 卡片容器 */
-      tr {
-        display: block; background: #202020; border: 1px solid #333;
-        border-radius: 8px; margin-bottom: 12px;
-        padding: 16px 16px 16px 48px; position: relative;
-      }
-
-      /* 选中状态 */
+      tr { display: block; background: #202020; border: 1px solid #333; border-radius: 8px; margin-bottom: 12px; padding: 16px 16px 16px 48px; position: relative; }
       tr.selected { border-color: #52B54B; background: #252525; border-left: 3px solid #52B54B; }
-
-      /* 复选框定位 */
       td:first-child { display: block; position: absolute; left: 12px; top: 16px; padding: 0; border: none; }
-
-      /* 内容单元格 */
       td { display: block; padding: 4px 0; border: none; text-align: left; word-break: break-all; }
-
-      /* 子域名样式 */
       td.col-sub { font-size: 16px; font-weight: bold; color: #fff; margin-bottom: 4px; }
-
-      /* 上游地址样式 */
       td.col-upstream { font-size: 13px; color: #A0A0A0; margin-bottom: 12px; }
-
-      /* 操作按钮区域 */
-      td.col-actions {
-        border-top: 1px solid #333; padding-top: 12px; margin-top: 8px;
-        display: flex; justify-content: flex-end;
-      }
-
-      /* 按钮触摸目标 */
+      td.col-actions { border-top: 1px solid #333; padding-top: 12px; margin-top: 8px; display: flex; justify-content: flex-end; }
       .btn-sm { min-height: 44px; padding: 12px 16px; }
-
-      /* 容器调整 */
       .container { padding: 10px; }
-
-      /* 批量操作栏移动端优化 */
       .bulk-bar { bottom: 10px; left: 10px; right: 10px; transform: none; border-radius: 8px; }
     }
   </style>
@@ -480,43 +474,15 @@ app.get('/manage', (c) => {
     let currentVersion = null;
     let editingSubdomain = null;
     let selectedRoutes = new Set();
-
-    // HTML 转义函数（防止 XSS 攻击）
-    function escapeHtml(unsafe) {
-      if (typeof unsafe !== 'string') return '';
-      return unsafe
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#039;');
-    }
-
-    function showToast(message, isError = false) {
-      const toast = document.getElementById('toast');
-      toast.textContent = message;
-      toast.className = isError ? 'error' : '';
-      toast.style.display = 'block';
-      setTimeout(() => toast.style.display = 'none', 3000);
-    }
-
+    function escapeHtml(unsafe) { if (typeof unsafe !== 'string') return ''; return unsafe.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;'); }
+    function showToast(message, isError = false) { const toast = document.getElementById('toast'); toast.textContent = message; toast.className = isError ? 'error' : ''; toast.style.display = 'block'; setTimeout(() => toast.style.display = 'none', 3000); }
     async function apiCall(endpoint, options = {}) {
-      if (!token) {
-        token = prompt('请输入管理员令牌（ADMIN_TOKEN）：');
-        if (!token) throw new Error('需要提供令牌');
-      }
-      const res = await fetch(endpoint, {
-        ...options,
-        headers: { ...options.headers, 'Authorization': 'Bearer ' + token }
-      });
-      if (res.status === 401) {
-        token = '';
-        throw new Error('令牌无效或未授权');
-      }
+      if (!token) { token = prompt('请输入管理员令牌（ADMIN_TOKEN）：'); if (!token) throw new Error('需要提供令牌'); }
+      const res = await fetch(endpoint, { ...options, headers: { ...options.headers, 'Authorization': 'Bearer ' + token } });
+      if (res.status === 401) { token = ''; throw new Error('令牌无效或未授权'); }
       if (!res.ok) throw new Error(await res.text());
       return res.json();
     }
-
     async function loadRoutes() {
       try {
         const data = await apiCall('/manage/api/mappings');
@@ -524,10 +490,7 @@ app.get('/manage', (c) => {
         const tbody = document.getElementById('routesBody');
         const mappings = data.mappings || {};
         const entries = Object.entries(mappings);
-
-        if (entries.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#A0A0A0;">暂无路由配置</td></tr>';
-        } else {
+        if (entries.length === 0) { tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#A0A0A0;">暂无路由配置</td></tr>'; } else {
           tbody.innerHTML = entries.map(([sub, config]) => {
             const escapedSub = escapeHtml(sub);
             const escapedUpstream = escapeHtml(config.upstream);
@@ -544,224 +507,57 @@ app.get('/manage', (c) => {
                   <button class="btn-sm danger" onclick="deleteRoute('\${jsEscapedSub}')">删除</button>
                 </div>
               </td>
-            </tr>
-          \`;
+            </tr>\`;
           }).join('');
         }
-        const displayVersion = currentVersion
-          ? 'v' + new Date(parseInt(currentVersion.slice(1))).toISOString().slice(0,16).replace('T',' ')
-          : '未初始化';
+        const displayVersion = currentVersion ? 'v' + new Date(parseInt(currentVersion.slice(1))).toISOString().slice(0,16).replace('T',' ') : '未初始化';
         document.getElementById('status').innerHTML = \`<small style="color:#A0A0A0;">版本：\${displayVersion} | 路由数：\${entries.length}</small>\`;
-      } catch (e) {
-        showToast('加载路由失败：' + e.message, true);
-      }
+      } catch (e) { showToast('加载路由失败：' + e.message, true); }
     }
-
     async function addRoute(e) {
       e.preventDefault();
       const form = e.target;
       const sub = document.getElementById('subdomain').value;
       const upstream = document.getElementById('upstream').value;
-
       try {
         form.classList.add('loading');
         const headers = { 'Content-Type': 'application/json' };
         if (currentVersion) headers['If-Match'] = currentVersion;
-
-        // 如果是编辑模式且子域名改变了，需要先删除旧路由
         if (editingSubdomain !== null && editingSubdomain !== sub) {
-          const deleteResult = await apiCall(\`/manage/api/mappings/\${editingSubdomain}\`, {
-            method: 'DELETE',
-            headers: { 'If-Match': currentVersion }
-          });
-          // 更新版本号，避免后续 PUT 请求冲突
-          if (deleteResult && deleteResult.version) {
-            currentVersion = deleteResult.version;
-            headers['If-Match'] = currentVersion;
-          }
+          const deleteResult = await apiCall(\`/manage/api/mappings/\${editingSubdomain}\`, { method: 'DELETE', headers: { 'If-Match': currentVersion } });
+          if (deleteResult && deleteResult.version) { currentVersion = deleteResult.version; headers['If-Match'] = currentVersion; }
         }
-
-        // 添加或更新路由
-        await apiCall(\`/manage/api/mappings/\${sub}\`, {
-          method: 'PUT',
-          headers,
-          body: JSON.stringify({ upstream })
-        });
-
+        await apiCall(\`/manage/api/mappings/\${sub}\`, { method: 'PUT', headers, body: JSON.stringify({ upstream }) });
         showToast(editingSubdomain !== null ? '路由更新成功' : '路由新增成功');
         cancelEdit();
         await loadRoutes();
-      } catch (e) {
-        showToast('保存路由失败：' + e.message, true);
-      } finally {
-        form.classList.remove('loading');
-      }
+      } catch (e) { showToast('保存路由失败：' + e.message, true); } finally { form.classList.remove('loading'); }
     }
-
-    function editRoute(sub, upstream) {
-      editingSubdomain = sub;
-      document.getElementById('subdomain').value = sub;
-      document.getElementById('upstream').value = upstream;
-      document.getElementById('submitBtn').textContent = '更新路由';
-      document.getElementById('cancelBtn').style.display = 'inline-block';
-      document.getElementById('subdomain').focus();
-    }
-
-    function cancelEdit() {
-      editingSubdomain = null;
-      document.getElementById('addForm').reset();
-      document.getElementById('submitBtn').textContent = '新增路由';
-      document.getElementById('cancelBtn').style.display = 'none';
-    }
-
-    // 全选/取消全选
-    function toggleSelectAll() {
-      const master = document.getElementById('selectAll');
-      const checks = document.querySelectorAll('.route-check');
-      checks.forEach(c => {
-        c.checked = master.checked;
-        if (master.checked) {
-          selectedRoutes.add(c.value);
-        } else {
-          selectedRoutes.delete(c.value);
-        }
-      });
-      updateSelectionState();
-    }
-
-    // 更新选中状态
+    function editRoute(sub, upstream) { editingSubdomain = sub; document.getElementById('subdomain').value = sub; document.getElementById('upstream').value = upstream; document.getElementById('submitBtn').textContent = '更新路由'; document.getElementById('cancelBtn').style.display = 'inline-block'; document.getElementById('subdomain').focus(); }
+    function cancelEdit() { editingSubdomain = null; document.getElementById('addForm').reset(); document.getElementById('submitBtn').textContent = '新增路由'; document.getElementById('cancelBtn').style.display = 'none'; }
+    function toggleSelectAll() { const master = document.getElementById('selectAll'); const checks = document.querySelectorAll('.route-check'); checks.forEach(c => { c.checked = master.checked; if (master.checked) selectedRoutes.add(c.value); else selectedRoutes.delete(c.value); }); updateSelectionState(); }
     function updateSelectionState() {
-      const checks = document.querySelectorAll('.route-check');
-      selectedRoutes.clear();
-
-      checks.forEach(c => {
-        if (c.checked) {
-          selectedRoutes.add(c.value);
-        }
-        // 视觉高亮
-        const tr = c.closest('tr');
-        if (c.checked) {
-          tr.classList.add('selected');
-        } else {
-          tr.classList.remove('selected');
-        }
-      });
-
-      // 更新主复选框状态
-      const master = document.getElementById('selectAll');
-      master.checked = checks.length > 0 && selectedRoutes.size === checks.length;
-      master.indeterminate = selectedRoutes.size > 0 && selectedRoutes.size < checks.length;
-
-      // 更新批量操作栏
-      const bar = document.getElementById('bulkActionBar');
-      const countSpan = document.getElementById('selectedCount');
-      if (selectedRoutes.size > 0) {
-        bar.style.display = 'flex';
-        countSpan.textContent = \`已选择 \${selectedRoutes.size} 项\`;
-      } else {
-        bar.style.display = 'none';
-      }
+      const checks = document.querySelectorAll('.route-check'); selectedRoutes.clear();
+      checks.forEach(c => { if (c.checked) selectedRoutes.add(c.value); const tr = c.closest('tr'); if (c.checked) tr.classList.add('selected'); else tr.classList.remove('selected'); });
+      const master = document.getElementById('selectAll'); master.checked = checks.length > 0 && selectedRoutes.size === checks.length; master.indeterminate = selectedRoutes.size > 0 && selectedRoutes.size < checks.length;
+      const bar = document.getElementById('bulkActionBar'); const countSpan = document.getElementById('selectedCount');
+      if (selectedRoutes.size > 0) { bar.style.display = 'flex'; countSpan.textContent = \`已选择 \${selectedRoutes.size} 项\`; } else { bar.style.display = 'none'; }
     }
-
-    // 批量删除
     async function batchDelete() {
-      const targets = Array.from(selectedRoutes);
-      if (targets.length === 0) return;
-
-      if (!confirm(\`确定要删除选中的 \${targets.length} 个路由吗？\`)) return;
-
+      const targets = Array.from(selectedRoutes); if (targets.length === 0) return; if (!confirm(\`确定要删除选中的 \${targets.length} 个路由吗？\`)) return;
       try {
-        const headers = { 'Content-Type': 'application/json' };
-        if (currentVersion) headers['If-Match'] = currentVersion;
-
-        const result = await apiCall('/manage/api/batch-delete', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ subdomains: targets })
-        });
-
-        showToast(\`成功删除 \${result.count} 个路由\`);
-        selectedRoutes.clear();
-        document.getElementById('bulkActionBar').style.display = 'none';
-        await loadRoutes();
-      } catch (e) {
-        showToast('批量删除失败：' + e.message, true);
-      }
+        const headers = { 'Content-Type': 'application/json' }; if (currentVersion) headers['If-Match'] = currentVersion;
+        const result = await apiCall('/manage/api/batch-delete', { method: 'POST', headers, body: JSON.stringify({ subdomains: targets }) });
+        showToast(\`成功删除 \${result.count} 个路由\`); selectedRoutes.clear(); document.getElementById('bulkActionBar').style.display = 'none'; await loadRoutes();
+      } catch (e) { showToast('批量删除失败：' + e.message, true); }
     }
-
-    async function deleteRoute(sub) {
-      if (!confirm(\`确定要删除路由 "\${sub}" 吗？\`)) return;
-
-      try {
-        const headers = {};
-        if (currentVersion) headers['If-Match'] = currentVersion;
-        await apiCall(\`/manage/api/mappings/\${sub}\`, {
-          method: 'DELETE',
-          headers
-        });
-        showToast('路由删除成功');
-        await loadRoutes();
-      } catch (e) {
-        showToast('删除路由失败：' + e.message, true);
-      }
-    }
-
-    async function exportConfig() {
-      try {
-        const data = await apiCall('/manage/api/export');
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = \`emby-routes-\${Date.now()}.json\`;
-        a.click();
-        showToast('配置导出成功');
-      } catch (e) {
-        showToast('导出配置失败：' + e.message, true);
-      }
-    }
-
+    async function deleteRoute(sub) { if (!confirm(\`确定要删除路由 "\${sub}" 吗？\`)) return; try { const headers = {}; if (currentVersion) headers['If-Match'] = currentVersion; await apiCall(\`/manage/api/mappings/\${sub}\`, { method: 'DELETE', headers }); showToast('路由删除成功'); await loadRoutes(); } catch (e) { showToast('删除路由失败：' + e.message, true); } }
+    async function exportConfig() { try { const data = await apiCall('/manage/api/export'); const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = \`emby-routes-\${Date.now()}.json\`; a.click(); showToast('配置导出成功'); } catch (e) { showToast('导出配置失败：' + e.message, true); } }
     function importConfig() {
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = 'application/json';
-      input.onchange = async (e) => {
-        try {
-          const file = e.target.files[0];
-          const text = await file.text();
-          const data = JSON.parse(text);
-
-          const headers = { 'Content-Type': 'application/json' };
-          if (currentVersion) headers['If-Match'] = currentVersion;
-          await apiCall('/manage/api/import', {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ mappings: data.mappings || data })
-          });
-          showToast('配置导入成功');
-          await loadRoutes();
-        } catch (e) {
-          showToast('导入配置失败：' + e.message, true);
-        }
-      };
-      input.click();
+      const input = document.createElement('input'); input.type = 'file'; input.accept = 'application/json';
+      input.onchange = async (e) => { try { const file = e.target.files[0]; const text = await file.text(); const data = JSON.parse(text); const headers = { 'Content-Type': 'application/json' }; if (currentVersion) headers['If-Match'] = currentVersion; await apiCall('/manage/api/import', { method: 'POST', headers, body: JSON.stringify({ mappings: data.mappings || data }) }); showToast('配置导入成功'); await loadRoutes(); } catch (e) { showToast('导入配置失败：' + e.message, true); } }; input.click();
     }
-
-    async function rollback() {
-      if (!confirm('确定要回滚到上一个版本吗？')) return;
-
-      try {
-        await apiCall('/manage/api/rollback', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' }
-        });
-        showToast('回滚成功');
-        await loadRoutes();
-      } catch (e) {
-        showToast('回滚失败：' + e.message, true);
-      }
-    }
-
+    async function rollback() { if (!confirm('确定要回滚到上一个版本吗？')) return; try { await apiCall('/manage/api/rollback', { method: 'POST', headers: { 'Content-Type': 'application/json' } }); showToast('回滚成功'); await loadRoutes(); } catch (e) { showToast('回滚失败：' + e.message, true); } }
     loadRoutes();
   </script>
 </body>
@@ -968,104 +764,129 @@ app.all('*', async (c) => {
     const clHeader = req.headers.get('content-length')
     const cl = clHeader ? parseInt(clHeader, 10) : NaN
     const clValid = Number.isFinite(cl)
-    canBufferBody = clValid && cl <= CONFIG.MAX_BODY_BUFFER
+    const isPlaybackInfo = CONFIG.PLAYBACKINFO_REGEX.test(url.pathname)
 
-    if (canBufferBody) {
-      reqBody = await req.arrayBuffer()
-      proxyHeaders.delete('content-length')
-    } else {
-      reqBody = req.body
+    if (isPlaybackInfo) {
+      if (!clValid) {
+        const { buf, truncated } = await readBodyWithLimit(req.clone(), 65536)
+        if (!truncated && buf) {
+          reqBody = buf
+          canBufferBody = true
+          proxyHeaders.delete('content-length')
+        }
+      } else if (cl <= 65536) {
+        const { buf, truncated } = await readBodyWithLimit(req.clone(), 65536)
+        if (!truncated && buf) {
+          reqBody = buf
+          canBufferBody = true
+          proxyHeaders.delete('content-length')
+        }
+      }
+    } else if (clValid && cl <= CONFIG.MAX_BODY_BUFFER) {
+      const { buf, truncated } = await readBodyWithLimit(req.clone(), CONFIG.MAX_BODY_BUFFER)
+      if (!truncated && buf) {
+        reqBody = buf
+        canBufferBody = true
+        proxyHeaders.delete('content-length')
+      }
     }
   }
 
   // --- 判别请求类型 ---
   const isStatic = CONFIG.STATIC_REGEX.test(url.pathname)
   const isVideo = CONFIG.VIDEO_REGEX.test(url.pathname)
-  const isApiCacheable = CONFIG.API_CACHE_REGEX.test(url.pathname)
+  const isApiCacheable = req.method === 'GET' &&
+                         CONFIG.API_CACHE_REGEX.test(url.pathname) &&
+                         !CONFIG.API_CACHE_BYPASS_REGEX.test(url.search)
   const isWebSocket = (req.headers.get('Upgrade') || '').toLowerCase() === 'websocket'
   const isM3U8 = CONFIG.M3U8_REGEX.test(url.pathname)
   const isPlaybackInfo = CONFIG.PLAYBACKINFO_REGEX.test(url.pathname)
   const hasRange = !!req.headers.get('range')
   const isAndroidTV = CONFIG.ANDROID_TV_UA.test(req.headers.get('user-agent') || '')
 
-  // RFC 7230: 清理 hop-by-hop 头（WebSocket除外）
+  // 匿名图片缓存：仅对带有效 tag 参数的 Items 图片路径启用（大小写不敏感）
+  const tagParam = url.searchParams.get('tag') || ''
+  const tag = tagParam.trim()
+  const hasValidTag = !!tag && (TAG_HEX_REGEX.test(tag) || TAG_BASE64URL_REGEX.test(tag))
+  const isTaggedArtwork = /\/Items\/[^\/]+\/Images\/[^\/]+/i.test(url.pathname) &&
+                          !/\/(Users|Persons)\//i.test(url.pathname) &&
+                          hasValidTag
+
   if (!isWebSocket) {
     cleanupHopByHopHeaders(proxyHeaders, false, true)
   }
 
-  // Android TV：设置 keep-alive (skip for WebSocket to preserve Upgrade header)
   if (isAndroidTV && !isWebSocket) {
     proxyHeaders.set('Connection', 'keep-alive')
   }
 
-  // CPU optimization: only compute hash when cache key needed (whitelisted paths)
-  // For static resources, skip hash if no token hint (avoid wasting CPU on anonymous requests)
+  // [P0-4] Token Hint 逻辑更新：检查 Query Params
   const hasTokenHint = req.headers.has('X-Emby-Token') ||
                        req.headers.has('X-MediaBrowser-Token') ||
                        url.searchParams.has('api_key') ||
+                       url.searchParams.has('X-Emby-Token') ||
+                       url.searchParams.has('X-MediaBrowser-Token') ||
                        req.headers.has('Authorization') ||
                        req.headers.has('X-Emby-Authorization')
 
   const needsCacheKey = !isVideo && !hasRange && (isM3U8 || isPlaybackInfo || isApiCacheable || (isStatic && hasTokenHint))
-  const tokenHash = needsCacheKey ? await buildTokenKey(req, url) : null
-
-  // 检查是否有有效 token（防止匿名用户缓存泄露）
-  // CPU optimization: cache 'anon:nodev' hash to avoid recalculation
-  if (!globalThis[ANON_HASH_CACHE_KEY]) {
-    globalThis[ANON_HASH_CACHE_KEY] = await sha256Hex('anon:nodev')
-  }
-  // Note: hasToken will be false when tokenHash is null (hash skipped for media/range/anonymous static)
-  // This is intentional - requests without cache keys should not trigger caching logic
-  const hasToken = tokenHash && tokenHash !== globalThis[ANON_HASH_CACHE_KEY]
+  const tokenResult = needsCacheKey ? await buildTokenKey(req, url) : null
+  const tokenHash = tokenResult?.hash || null
+  const hasRealToken = tokenResult?.hasRealToken || false
+  const hasToken = tokenHash && hasRealToken
 
   // --- Cloudflare 策略配置 ---
   const cfConfig = {
-    // 1. 静态图片：强力缓存 1 年（仅对已认证用户，防止跨用户泄露）
-    cacheEverything: isStatic && hasToken,
-    cacheTtl: (isStatic && hasToken) ? 31536000 : 0,
-
-    // 2. API 微缓存：缓存 10 秒 (解决 Resume 接口慢的问题)
-    // 注意：只有 GET 请求才会生效 cacheTtl
+    cacheEverything: (isStatic && (hasToken || isTaggedArtwork)),
+    cacheTtl: 0,
     cacheTtlByStatus: isApiCacheable ? { "200-299": 10 } : null,
-
-    // 3. 性能优化开关
-    // 静态资源：开启有损压缩 (polish) 以加快图片传输
-    // 视频资源：彻底关闭所有处理 (off)
     polish: isStatic ? 'lossy' : 'off',
     minify: { javascript: isStatic, css: isStatic, html: isStatic },
-
-    // 4. 视频流核心：关闭缓冲
     mirage: false,
     scrapeShield: false,
     apps: false,
   }
 
-  // 静态资源缓存键隔离（防止跨用户泄露）
-  if (isStatic && hasToken) {
+  if (isStatic && (hasToken || isTaggedArtwork)) {
     const keyUrl = new URL(targetUrl)
     if (keyUrl.searchParams.sort) keyUrl.searchParams.sort()
-    cfConfig.cacheKey = `${keyUrl.pathname}?${keyUrl.searchParams.toString()}::${tokenHash}`
+
+    if (isTaggedArtwork && !hasToken) {
+      cfConfig.cacheKey = `${url.hostname}::${keyUrl.pathname}?${keyUrl.searchParams.toString()}`
+    } else {
+      cfConfig.cacheKey = `${url.hostname}::${keyUrl.pathname}?${keyUrl.searchParams.toString()}::${tokenHash}`
+    }
+
+    cfConfig.cacheEverything = true
+    cfConfig.cacheTtl = 0
+    cfConfig.cacheTtlByStatus = { "200-299": 31536000 }
   }
 
-  // 如果是 API 微缓存，也需要开启 cacheEverything 才能生效
+  // [P0-3] API 微缓存 De-noising (基于白名单构建 CacheKey)
   if (isApiCacheable && hasToken) {
     cfConfig.cacheEverything = true
-    // 缓存安全：token-aware cacheKey 防止跨用户泄露
     const keyUrl = new URL(targetUrl)
-    if (keyUrl.searchParams.sort) keyUrl.searchParams.sort()
-    cfConfig.cacheKey = `${keyUrl.pathname}?${keyUrl.searchParams.toString()}::${tokenHash}`
+    
+    // De-noising: 仅保留白名单参数
+    const safeParams = new URLSearchParams()
+    for (const [key, val] of keyUrl.searchParams) {
+      if (CACHE_QUERY_ALLOWLIST.has(key)) {
+        safeParams.set(key, val)
+      }
+    }
+    safeParams.sort()
+    
+    cfConfig.cacheKey = `${url.hostname}::${keyUrl.pathname}?${safeParams.toString()}::${tokenHash}`
   }
 
-  // m3u8 微缓存（仅 GET 且非 Range，且有 token）
   if (isM3U8 && req.method === 'GET' && !hasRange && hasToken) {
     cfConfig.cacheEverything = true
     cfConfig.cacheTtl = CONFIG.M3U8_TTL
     const keyUrl = new URL(targetUrl)
     if (keyUrl.searchParams.sort) keyUrl.searchParams.sort()
-    cfConfig.cacheKey = `${keyUrl.pathname}?${keyUrl.searchParams.toString()}::${tokenHash}`
+    cfConfig.cacheKey = `${url.hostname}::${keyUrl.pathname}?${keyUrl.searchParams.toString()}::${tokenHash}`
   }
 
-  // Range 请求不参与缓存，确保按字节区间直连
   if (hasRange) {
     cfConfig.cacheEverything = false
     cfConfig.cacheTtl = 0
@@ -1080,7 +901,6 @@ app.all('*', async (c) => {
     cf: { ...cfConfig }
   }
 
-  // DEBUG mode: performance metrics (enabled via env.DEBUG)
   const DEBUG = c.env?.DEBUG === 'true' || c.env?.DEBUG === '1'
   const kind = isVideo ? 'media' : (hasRange ? 'range' : (isM3U8 ? 'm3u8' : (isPlaybackInfo ? 'playbackinfo' : 'api')))
   let kvReadMs = routeKvMs || 0
@@ -1092,20 +912,13 @@ app.all('*', async (c) => {
   try {
     let response;
 
-    // Android TV：设置 keep-alive (skip for WebSocket to preserve Upgrade header)
-    if (isAndroidTV && !isWebSocket) {
-      proxyHeaders.set('Connection', 'keep-alive')
-    }
-
-    // PlaybackInfo POST 微缓存（caches.default）
-    if (isPlaybackInfo && req.method === 'POST' && !hasRange && canBufferBody) {
+    if (isPlaybackInfo && req.method === 'POST' && !hasRange && canBufferBody && hasToken) {
       const bodyHash = await sha256Hex(reqBody || '')
-      // Stable cache key: manually sort query parameters
       const sortedParams = Array.from(url.searchParams.entries())
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([k, v]) => `${k}=${v}`)
         .join('&')
-      const cacheKey = `https://cache.playbackinfo.local${url.pathname}?${sortedParams}&h=${tokenHash}&b=${bodyHash}`
+      const cacheKey = `https://cache.playbackinfo.local/${url.hostname}${url.pathname}?${sortedParams}&h=${tokenHash}&b=${bodyHash}`
       const cacheReq = new Request(cacheKey, { method: 'GET' })
       const cache = caches.default
       const cached = await cache.match(cacheReq)
@@ -1114,21 +927,17 @@ app.all('*', async (c) => {
         return new Response(cached.body, { status: cached.status, headers: cached.headers })
       }
 
-      // Critical path: bounded timeout, no retry
       const t0 = Date.now()
       subreqCount++
       const upstreamResp = await fetchWithTimeout(targetUrl.toString(), fetchOptions, CONFIG.CRITICAL_TIMEOUT)
       upstreamMs += Date.now() - t0
 
       const resHeaders = new Headers(upstreamResp.headers)
-
-      // 清理hop-by-hop头（PlaybackInfo不会是101响应）
       cleanupHopByHopHeaders(resHeaders, false, false)
 
       if (upstreamResp.ok && (resHeaders.get('content-type') || '').includes('application/json')) {
         resHeaders.set('Cache-Control', `private, max-age=${CONFIG.PLAYBACKINFO_TTL}`)
         const toStore = new Response(upstreamResp.body, { status: upstreamResp.status, headers: resHeaders })
-
         c.executionCtx.waitUntil(caches.default.put(cacheReq, toStore.clone()))
         response = toStore
       } else {
@@ -1137,31 +946,26 @@ app.all('*', async (c) => {
     }
 
     if (!response) {
-      // 媒体请求处理分支
       if ((isVideo || hasRange) && !isWebSocket) {
-        // Media/Range: direct passthrough (no timeout/retry)
         const t0 = Date.now()
         subreqCount++
         response = await fetch(targetUrl.toString(), fetchOptions)
         upstreamMs += Date.now() - t0
       } else if (isWebSocket || (req.method === 'POST' && !(isPlaybackInfo && !hasRange))) {
-        // WebSocket or other POST: direct passthrough (no timeout)
         const t0 = Date.now()
         subreqCount++
         response = await fetch(targetUrl.toString(), fetchOptions)
         upstreamMs += Date.now() - t0
       } else {
-        // 其他请求：区分关键路径和非关键路径
+        // [P0-1] Critical Path 逻辑更新：API Cacheable 的请求均视为关键路径
         const isCriticalPath = (isM3U8 && req.method === 'GET') || (isApiCacheable && req.method === 'GET') || (isPlaybackInfo && req.method === 'POST')
 
         if (isCriticalPath) {
-          // Critical path: bounded timeout, no retry
           const t0 = Date.now()
           subreqCount++
           response = await fetchWithTimeout(targetUrl.toString(), fetchOptions, CONFIG.CRITICAL_TIMEOUT)
           upstreamMs += Date.now() - t0
         } else {
-          // Non-critical: keep timeout, but no retry
           const timeout = isAndroidTV ? CONFIG.ANDROID_API_TIMEOUT : CONFIG.API_TIMEOUT
           const t0 = Date.now()
           subreqCount++
@@ -1171,13 +975,8 @@ app.all('*', async (c) => {
       }
     }
 
-
-
-
-    // --- 响应处理 ---
     const resHeaders = new Headers(response.headers)
 
-    // RFC 7230: 清理 hop-by-hop 头（101响应除外）
     if (response.status !== 101) {
       cleanupHopByHopHeaders(resHeaders, false, false)
     }
@@ -1186,35 +985,33 @@ app.all('*', async (c) => {
     resHeaders.delete('clear-site-data')
     resHeaders.set('access-control-allow-origin', '*')
 
-    // Connection optimization: Android TV uses keep-alive, others allow reuse (no forced close)
     if (isVideo && isAndroidTV) {
       resHeaders.set('Connection', 'keep-alive')
       resHeaders.set('Keep-Alive', 'timeout=30, max=1000')
     }
 
-    // m3u8 Cache-Control Strategy: Use private to prevent client-side/intermediate cache issues
     if (isM3U8 && response.ok) {
       resHeaders.set('Cache-Control', `private, max-age=${CONFIG.M3U8_TTL}`)
     }
 
-    // [补充] 强制静态图片缓存命中（仅对已认证用户，防止跨用户泄露）
-    // Emby 有时会返回 private 或 no-cache 头，导致 CF 即使配置了 cacheEverything 也不缓存
-    // 我们强制覆盖这些头
     if (isStatic && response.status === 200) {
-        if (hasToken) {
-            // 已认证用户：启用长期缓存
+        if (hasToken || isTaggedArtwork) {
             resHeaders.set('Cache-Control', 'public, max-age=31536000, immutable')
             resHeaders.delete('Pragma')
             resHeaders.delete('Expires')
         } else {
-            // 匿名用户：禁用缓存，防止跨用户泄露
             resHeaders.set('Cache-Control', 'no-store, no-cache, must-revalidate')
             resHeaders.set('Pragma', 'no-cache')
             resHeaders.set('Expires', '0')
         }
     }
 
-    // DEBUG: Server-Timing header
+    if (isApiCacheable && req.method === 'GET' && hasToken && response.ok) {
+      resHeaders.set('Cache-Control', 'public, max-age=0, s-maxage=10')
+      resHeaders.delete('Pragma')
+      resHeaders.delete('Expires')
+    }
+
     if (DEBUG) {
       const timing = [
         `kind;desc="${kind}"`,
@@ -1225,7 +1022,6 @@ app.all('*', async (c) => {
         `subreq;desc="${subreqCount}"`
       ].join(', ');
       resHeaders.set('Server-Timing', timing);
-      // 将性能信息和请求路径一起打印到日志中
       console.log(`[PERF] ${req.method} ${url.pathname} | Status: ${response.status} | ${timing}`);
     }
 
@@ -1233,11 +1029,10 @@ app.all('*', async (c) => {
       return new Response(null, { status: 101, webSocket: response.webSocket, headers: resHeaders })
     }
 
-    // 修正重定向
     if ([301, 302, 303, 307, 308].includes(response.status)) {
         const location = resHeaders.get('location')
         if (location) {
-             const locUrl = new URL(location, targetUrl.href) // 兼容相对路径
+             const locUrl = new URL(location, targetUrl.href)
              if (locUrl.hostname === targetUrl.hostname) {
                  resHeaders.set('Location', locUrl.pathname + locUrl.search)
              }
@@ -1251,7 +1046,22 @@ app.all('*', async (c) => {
     })
 
   } catch (error) {
-    return new Response(JSON.stringify({ error: `Proxy Error: ${error.message}` }), { status: 502 })
+    // [P1-1] 错误语义化：区分 Timeout (504) 与 Bad Gateway (502)
+    const isTimeout = error.name === 'AbortError' || error.message === 'Timeout' || (error.code === 23); // 23 is Cloudflare-specific generic timeout code sometimes
+    const status = isTimeout ? 504 : 502
+    const statusText = isTimeout ? 'Gateway Timeout' : 'Bad Gateway'
+    
+    // 增加诊断 Header
+    const errorHeaders = new Headers({ 'Content-Type': 'application/json' })
+    if (DEBUG) {
+      errorHeaders.set('X-Proxy-Error', isTimeout ? `Timeout-${CONFIG.CRITICAL_TIMEOUT}ms` : `Upstream-${error.message}`)
+    }
+
+    const message = DEBUG ? `Proxy Error: ${error?.message || String(error)}` : statusText
+    return new Response(JSON.stringify({ error: message }), {
+      status: status,
+      headers: errorHeaders
+    })
   }
 })
 
