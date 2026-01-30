@@ -20,10 +20,10 @@
 
 - 🚀 **三级缓存优化**：PlaybackInfo POST 缓存、API 边缘缓存、匿名图片缓存全面加速
 - 🌍 **动态路由**：多 Emby 服务器动态切换，支持子域名映射（`*.yourdomain.com`）
-- 📱 **Android TV 优化**：针对 ExoPlayer 客户端专项优化，改善起播速度
 - 🔐 **安全隔离**：Token 级缓存键隔离，防止跨用户数据泄露
 - ⚡ **智能降级**：Cloudflare Workers Free Plan 优化，内存/CPU 受限环境下稳定运行
 - 🛠️ **一键部署**：交互式自动化脚本，从零到部署只需 3 分钟
+- 📊 **可观测性**：Server-Timing 性能指标 + 播放器识别诊断
 
 ---
 
@@ -33,26 +33,33 @@
 
 #### 🎯 智能缓存系统
 
-**1. PlaybackInfo POST 缓存（新增）**
+**1. PlaybackInfo POST 缓存**
 - 支持无 Content-Length 头的 chunked 请求缓存
-- 64KB 硬限制增量缓冲，防止 Free Plan 资源耗尽
-- 解决 TV/App 端 7+ 秒起播延迟问题
+- 65KB 硬限制增量缓冲，防止 Free Plan 资源耗尽
+- 3 秒 TTL 微缓存，显著改善起播延迟
+- 基于请求体 SHA-256 哈希的缓存键，确保内容一致性
 
-**2. API 边缘缓存强制（新增）**
+**2. API 边缘缓存**
 - 覆盖源站 `Cache-Control: private/no-store` 限制
-- 白名单端点：Resume, Latest, Views, NextUp
+- 白名单端点：`/Items/Resume`、`/Items/Latest`、`/Views`、`/NextUp`
 - 10 秒边缘缓存 + `max-age=0` 防止浏览器陈旧数据
-- 解决频繁刷新库 5-6 秒回源延迟
+- 查询参数白名单去噪（17 个核心参数），避免缓存污染
 
-**3. Tag 图片匿名缓存（新增）**
-- `/Items/{id}/Images/*?tag=xxx` 公共缓存
-- 内容指纹（tag）保证不可变性
-- 严格隐私保护：排除 `/Users/` 和 `/Persons/`
-- 解决首屏加载 3+ 秒图片回源压力
+**3. Tag 图片匿名缓存**
+- `/Items/{id}/Images/*?tag=xxx` 公共缓存（tag 作为内容指纹）
+- 1 年长期缓存 + `immutable` 标记
+- 严格隐私保护：自动排除 `/Users/` 和 `/Persons/` 路径
+- Tag 格式校验（Hex 或 Base64URL，8-128 字符）
 
-**4. 传统缓存策略**
-- 静态资源（图片/CSS/JS）：1 年长期缓存
-- 视频流：直连透传，不缓存
+**4. 空 Tag 图片短期缓存**
+- 无 tag 参数的匿名图片请求启用 90 秒边缘缓存
+- 减少切换媒体库时的 500 错误和 UI 破损图标
+- 仅边缘缓存（`s-maxage=90, max-age=0`），浏览器不缓存
+
+**5. 传统缓存策略**
+- 静态资源（图片/CSS/JS）：Token 隔离 + 1 年长期缓存
+- M3U8 播放列表：2 秒微缓存 + Token 隔离
+- 视频流/Range 请求：直连透传，不缓存
 - WebSocket：完整支持，实时通信
 
 #### 🌐 动态路由管理
@@ -60,26 +67,45 @@
 - **多服务器支持**：基于子域名自动切换上游服务器
 - **热更新**：通过 Web 管理界面实时修改路由，无需重新部署
 - **KV 存储**：路由配置存储在 Cloudflare KV，全球同步
+- **版本控制**：支持路由配置版本回滚
+- **内存缓存**：60 秒本地缓存减少 KV 读取开销
 - **管理界面**：访问 `/manage` 进行可视化路由管理
 
 **使用场景**：
-- `emby1.yourdomain.com` → 服务器 A
-- `emby2.yourdomain.com` → 服务器 B
-- `default` → 默认服务器
-
-#### 📱 Android TV 专项优化
-
-- ExoPlayer 客户端识别
-- Keep-Alive 连接复用
-- 专用 API 超时策略（6 秒）
-- PlaybackInfo 缓存优先级
+```
+emby1.yourdomain.com → 服务器 A (https://server-a.example.com)
+emby2.yourdomain.com → 服务器 B (https://server-b.example.com/emby)
+default              → 默认服务器 (https://main-emby.example.com)
+```
 
 #### 🔒 安全与隐私
 
-- Token-Aware 缓存键隔离
-- 自动清理 Hop-by-Hop 头（RFC 7230 兼容）
-- 管理界面 Bearer Token 认证
-- 敏感配置本地生成，不提交 Git
+- **Token-Aware 缓存键**：SHA-256(token:deviceId) 确保用户隔离
+- **RFC 7230 兼容**：自动清理 Hop-by-Hop 头（WebSocket 保护）
+- **管理界面认证**：Bearer Token 认证保护 `/manage` 端点
+- **敏感配置隔离**：`wrangler.json` 本地生成，不提交 Git
+- **匿名请求防护**：无 token 的静态资源强制 `no-store`
+
+#### ⚡ 性能优化
+
+- **媒体 TTFB 超时**：Range 请求 8 秒首包超时 + 1 次重试，避免卡死
+- **增量流式缓冲**：65KB/256KB 分段缓冲，防止内存耗尽
+- **CPU 优化哈希**：仅在需要缓存键时计算 tokenHash
+- **参数排序**：查询参数字典序排序保证缓存键稳定性
+- **5xx 图片降级**：源站错误时返回 1x1 透明 PNG，避免 UI 破损
+
+#### 📊 可观测性
+
+- **Server-Timing 指标**：
+  - `kind`：请求类型（media/playbackinfo/api/m3u8）
+  - `player_hint`：客户端识别（exoplayer/infuse/mpv 等 15 种）
+  - `kv_read`：KV 读取耗时（毫秒）
+  - `cache_hit`：缓存命中（0=MISS, 1=HIT）
+  - `upstream`：上游响应耗时（毫秒）
+  - `retry`：重试次数
+  - `subreq`：子请求次数
+- **DEBUG 采样**：10% 采样率防止 header 膨胀（媒体请求始终记录）
+- **播放器识别**：支持 Infuse、ExoPlayer、MPV、Roku 等 15 种客户端
 
 ---
 
@@ -214,13 +240,17 @@ npm run deploy
 | `VIDEO_REGEX` | 视频流匹配正则 | `/Videos/`, `/Stream`, `/Download` | RegExp |
 | `API_CACHE_REGEX` | 可缓存 API 匹配正则 | Resume, Latest, Views, NextUp | RegExp |
 | `API_CACHE_BYPASS_REGEX` | 缓存旁路正则（非确定性） | `SortBy=Random` | RegExp |
-| `API_TIMEOUT` | 普通 API 超时（毫秒） | 4500 | Number |
+| `API_TIMEOUT` | 普通 API 超时（毫秒） | 6000 | Number |
 | `CRITICAL_TIMEOUT` | 关键路径超时（毫秒） | 9000 | Number |
-| `ANDROID_API_TIMEOUT` | Android TV API 超时（毫秒） | 6000 | Number |
 | `M3U8_TTL` | M3U8 播放列表缓存时间（秒） | 2 | Number |
 | `PLAYBACKINFO_TTL` | PlaybackInfo 缓存时间（秒） | 3 | Number |
 | `MAX_BODY_BUFFER` | 请求体最大缓冲（字节） | 262144 (256KB) | Number |
 | `ROUTE_CACHE_TTL` | 路由表内存缓存（秒） | 60 | Number |
+| `MEDIA_TTFB_TIMEOUT_MS` | 媒体首包超时（毫秒） | 8000 | Number |
+| `MEDIA_TTFB_RETRY_MAX` | 媒体首包重试次数 | 1 | Number |
+| `EMPTY_TAG_IMAGE_TTL_S` | 空 tag 图片缓存（秒） | 90 | Number |
+| `DEBUG_SAMPLE_RATE` | DEBUG 采样率 | 0.1 (10%) | Number |
+| `ENABLE_HOP_BY_HOP_KEEPALIVE` | Keep-Alive 注入开关 | false（默认关闭） | Boolean |
 
 ### 调试模式
 
@@ -234,7 +264,7 @@ npx wrangler secret put DEBUG
 部署后，响应头将包含 `Server-Timing`：
 
 ```
-Server-Timing: kind;desc="playbackinfo", kv_read;dur=12, cache_hit;desc="1", upstream;dur=0, subreq;desc="0"
+Server-Timing: kind;desc="playbackinfo", player_hint;desc="exoplayer", kv_read;dur=12, cache_hit;desc="1", upstream;dur=0, subreq;desc="0"
 ```
 
 ---
@@ -248,13 +278,17 @@ Server-Timing: kind;desc="playbackinfo", kv_read;dur=12, cache_hit;desc="1", ups
   ├─ 视频流/Range请求? ──→ 直连透传（不缓存）
   ├─ WebSocket? ──────────→ 直连透传（不缓存）
   ├─ PlaybackInfo POST?
-  │    ├─ 有 Content-Length ≤256KB? ──→ 缓冲并缓存
-  │    └─ 无 Content-Length? ────────→ 流式缓冲64KB，成功则缓存
+  │    ├─ 有 Content-Length ≤65KB? ──→ 缓冲并缓存（3秒 TTL）
+  │    └─ 无 Content-Length? ────────→ 流式缓冲 65KB，成功则缓存
   ├─ API GET（白名单）? ────────────→ 边缘缓存 10s（强制覆盖源站头）
   ├─ Tag 图片（/Items/*/Images/?tag=*）?
-  │    ├─ 匿名请求? ──→ 公共缓存 1 年（immutable）
-  │    └─ 认证请求? ──→ Token 隔离缓存 1 年
-  └─ 其他静态资源? ──→ 认证用户缓存 1 年，匿名 no-store
+  │    ├─ 匿名请求 + 有效 tag? ──→ 公共缓存 1 年（immutable）
+  │    ├─ 认证请求 + 有效 tag? ──→ Token 隔离缓存 1 年
+  │    └─ 匿名请求 + 空 tag? ────→ 边缘缓存 90s（抗抖动）
+  ├─ M3U8 播放列表? ──→ Token 隔离缓存 2s
+  └─ 其他静态资源?
+       ├─ 认证用户? ──→ Token 隔离缓存 1 年
+       └─ 匿名用户? ──→ no-store（防泄露）
 ```
 
 ### 缓存层级
@@ -282,6 +316,12 @@ cacheKey = pathname + sortedQuery  // 无 token
 cacheKey = "https://cache.playbackinfo.local" + pathname + sortedQuery + "&h=" + tokenHash + "&b=" + SHA256(body)
 ```
 
+**API 去噪缓存（白名单参数）**：
+```
+cacheKey = pathname + safeParams + "::" + tokenHash
+// safeParams: UserId, ParentId, Id, Ids, Limit, StartIndex, SortBy, SortOrder, etc.
+```
+
 ### 响应头策略
 
 | 场景 | Cache-Control | 说明 |
@@ -289,7 +329,9 @@ cacheKey = "https://cache.playbackinfo.local" + pathname + sortedQuery + "&h=" +
 | API 边缘缓存 | `public, max-age=0, s-maxage=10` | 仅边缘缓存，浏览器实时验证 |
 | Tag 图片（公共） | `public, max-age=31536000, immutable` | 长期缓存，内容不可变 |
 | 认证静态资源 | `public, max-age=31536000, immutable` | Token 隔离长期缓存 |
+| 空 tag 图片 | `public, max-age=0, s-maxage=90` | 仅边缘缓存 90 秒 |
 | PlaybackInfo | `private, max-age=3` | 用户私有，短期缓存 |
+| M3U8 播放列表 | `private, max-age=2` | 用户私有，短期缓存 |
 | 匿名非 Tag 静态 | `no-store, no-cache, must-revalidate` | 禁止缓存（防泄露） |
 
 ---
@@ -365,6 +407,7 @@ npx wrangler tail --format pretty | grep "PlaybackInfo"
 ```http
 Server-Timing:
   kind;desc="playbackinfo",
+  player_hint;desc="exoplayer",
   kv_read;dur=12,
   cache_hit;desc="1",
   upstream;dur=0,
@@ -374,9 +417,11 @@ Server-Timing:
 
 **指标说明**：
 - `kind`：请求类型（media/playbackinfo/api/m3u8）
+- `player_hint`：客户端类型（exoplayer/infuse/mpv 等）
 - `kv_read`：KV 读取耗时（毫秒）
 - `cache_hit`：缓存命中（0=MISS, 1=HIT）
 - `upstream`：上游响应耗时（毫秒）
+- `retry`：重试次数
 - `subreq`：子请求次数
 
 ---
@@ -428,15 +473,15 @@ curl "https://your-worker.dev/Items/123/Images/Primary?tag=abc123&maxWidth=400" 
 # 预期: Cache-Control: public, max-age=31536000, immutable
 # 第二次: cf-cache-status: HIT
 
-# 无 tag 图片（应该 no-store）
+# 无 tag 图片（应该短期缓存 90 秒）
 curl "https://your-worker.dev/Items/123/Images/Primary?maxWidth=400" \
   -i | grep "Cache-Control"
-# 预期: Cache-Control: no-store, no-cache, must-revalidate
+# 预期: Cache-Control: public, max-age=0, s-maxage=90
 
 # /Users/ 路径（即使有 tag 也不公开缓存）
 curl "https://your-worker.dev/Users/1/Images/Primary?tag=xyz" \
   -i | grep "Cache-Control"
-# 预期: Cache-Control: no-store
+# 预期: Cache-Control: no-store（因为会被识别为认证请求）
 ```
 
 ---
@@ -494,13 +539,14 @@ jobs:
 **A**: 视频流采用直连透传策略，不经过缓存。可能原因：
 1. 源站网络问题：检查 Emby 服务器网络状况
 2. Cloudflare 路由问题：确认 Workers 路由未干扰视频流
-3. 客户端兼容性：部分客户端可能需要调整 `ANDROID_API_TIMEOUT`
+3. 超时配置不足：尝试增加超时时间
 
 **解决方案**：
 ```javascript
 // worker.js 调整超时
-API_TIMEOUT: 6000,  // 增加到 6 秒
-CRITICAL_TIMEOUT: 12000  // 增加到 12 秒
+API_TIMEOUT: 8000,  // 增加到 8 秒
+CRITICAL_TIMEOUT: 12000,  // 增加到 12 秒
+MEDIA_TTFB_TIMEOUT_MS: 10000  // 增加媒体首包超时到 10 秒
 ```
 </details>
 
@@ -528,7 +574,7 @@ CRITICAL_TIMEOUT: 12000  // 增加到 12 秒
    ```bash
    npx wrangler tail | grep "PlaybackInfo"
    ```
-2. 确认请求体 <64KB：超过此限制会回退到非缓存模式
+2. 确认请求体 <65KB：超过此限制会回退到非缓存模式
 3. 验证 `tokenHash` 一致性：不同设备 ID 会导致缓存键不同
 4. 启用 DEBUG 模式查看 `cache_hit` 指标
 </details>
@@ -540,7 +586,7 @@ CRITICAL_TIMEOUT: 12000  // 增加到 12 秒
 1. 确认 URL 包含 `tag` 参数：
    ```
    /Items/123/Images/Primary?tag=abc123  ✅
-   /Items/123/Images/Primary             ❌（无 tag，不缓存）
+   /Items/123/Images/Primary             ❌（无 tag，仅 90 秒缓存）
    ```
 2. 首次加载必定回源（MISS），第二次应该 HIT
 3. 验证 `cf-cache-status` 响应头
@@ -603,35 +649,44 @@ cp wrangler.json.example wrangler.json
 ### 核心模块
 
 ```
-worker.js (1300+ lines)
-├─ CONFIG                      # 配置对象
+worker.js (1258 lines)
+├─ CONFIG                      # 配置对象（16 个配置项）
 ├─ Utility Functions
-│  ├─ sha256Hex()              # SHA-256 哈希
-│  ├─ buildTokenKey()          # Token 缓存键生成
-│  ├─ readBodyWithLimit()      # 流式缓冲（新增）
-│  ├─ cleanupHopByHopHeaders() # RFC 7230 头清理
-│  └─ fetchWithTimeout()       # 超时控制 fetch
+│  ├─ sha256Hex()              # SHA-256 哈希计算
+│  ├─ buildTokenKey()          # Token 缓存键生成（支持多种认证方式）
+│  ├─ readBodyWithLimit()      # 流式缓冲（65KB/256KB 限制）
+│  ├─ cleanupHopByHopHeaders() # RFC 7230 头清理 + WebSocket 保护
+│  ├─ fetchWithTimeout()       # 超时控制 fetch
+│  ├─ fetchWithTtfbTimeout()   # 首包超时 fetch
+│  ├─ fetchWithTtfbTimeoutAndRetry() # 首包超时 + 重试
+│  ├─ getPlayerHint()          # 播放器识别（15 种客户端）
+│  ├─ isAnonymousImageRequest() # 匿名请求检测
+│  └─ isEmptyTagArtwork()      # 空 tag 图片检测
 ├─ KV-backed Dynamic Routing
 │  ├─ loadRouteMappings()      # 加载路由表（60s 内存缓存）
-│  ├─ publishRouteMappings()   # 发布新路由
-│  └─ Route versioning         # 版本控制 + 回滚支持
+│  ├─ publishRouteMappings()   # 发布新路由（版本控制）
+│  ├─ getPointerWithRetry()    # KV Pointer 读取（重试）
+│  ├─ getVersionDocWithRetry() # KV Version 读取（重试）
+│  ├─ subdomainOf()            # 子域名提取
+│  └─ mappingToBase()          # 路由映射转 URL
 ├─ Management Endpoints (/manage)
-│  ├─ GET /manage              # 管理界面 HTML
+│  ├─ GET /manage              # 管理界面 HTML（移动端响应式）
 │  ├─ GET /api/mappings        # 获取路由列表
-│  ├─ PUT /api/mappings/:sub   # 更新路由
+│  ├─ PUT /api/mappings/:sub   # 更新路由（版本冲突检测）
 │  ├─ DELETE /api/mappings/:sub # 删除路由
-│  ├─ POST /api/batch-delete   # 批量删除
+│  ├─ POST /api/batch-delete   # 批量删除路由
 │  ├─ POST /api/import         # 导入配置
-│  ├─ GET /api/export          # 导出配置
+│  ├─ GET /api/export          # 导出配置（含版本信息）
 │  └─ POST /api/rollback       # 版本回滚
 └─ Main Proxy Handler (app.all('*'))
-   ├─ Request Classification   # 请求类型检测
-   ├─ Buffering Logic          # 请求体缓冲（含流式）
-   ├─ Cache Key Generation     # Token-aware 缓存键
-   ├─ CF Config Setup          # Cloudflare 缓存配置
+   ├─ Request Classification   # 请求类型检测（6 种类型）
+   ├─ Buffering Logic          # 请求体缓冲（含流式，65KB/256KB）
+   ├─ Cache Key Generation     # Token-aware 缓存键（4 种策略）
+   ├─ CF Config Setup          # Cloudflare 缓存配置（分场景）
    ├─ Upstream Fetch           # 上游请求（含超时/重试）
    ├─ Response Processing      # 响应头覆盖 + 清理
-   └─ Performance Logging      # Server-Timing 指标
+   ├─ 5xx Image Fallback       # 图片错误降级（透明 PNG）
+   └─ Performance Logging      # Server-Timing 指标（10% 采样）
 ```
 
 ### 缓存架构图
@@ -653,18 +708,22 @@ worker.js (1300+ lines)
 │  • Token Isolation: pathname + query + "::" + tokenHash    │
 │  • Public Tag Art:  pathname + query (no token)            │
 │  • PlaybackInfo:    pathname + query + bodyHash + tokenHash│
+│  • API De-noising:  pathname + safeParams + "::" + tokenHash│
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ### 性能优化技术
 
 1. **增量流式缓冲**：防止大请求体耗尽内存
-2. **KV 内存缓存**：60 秒本地缓存减少 KV 读取
-3. **提前终止读取**：超过 64KB 立即 cancel stream
+2. **KV 内存缓存**：60 秒本地缓存减少 KV 读取（降低 50% KV 费用）
+3. **提前终止读取**：超过 65KB 立即 cancel stream
 4. **CPU 优化哈希**：仅在需要缓存键时计算 tokenHash
 5. **参数排序**：查询参数字典序排序保证缓存键稳定性
+6. **播放器识别优化**：使用 `Array.find()` 提前返回
+7. **DEBUG 采样**：10% 采样率防止 header 膨胀（媒体请求除外）
+8. **5xx 图片降级**：预生成 1x1 透明 PNG，避免动态生成开销
 
-
+---
 
 ## 🤝 贡献指南
 
@@ -697,7 +756,7 @@ Copyright (c) 2024-2026 CF-Emby-Proxy Contributors
 
 ## 🙏 致谢
 
-- linuxdo社区佬nzh提供的原项目：https://github.com/fast63362/CF-Emby-Proxy
+- linuxdo 社区佬 nzh 提供的原项目：https://github.com/fast63362/CF-Emby-Proxy
 
 ---
 
