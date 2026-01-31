@@ -53,6 +53,7 @@ const CONFIG = {
   MEDIA_RETRY_BACKOFF_FIRST_MAX_MS: 400,
   MEDIA_RETRY_BACKOFF_SECOND_MIN_MS: 400,  // 第2次重试抖动窗口
   MEDIA_RETRY_BACKOFF_SECOND_MAX_MS: 800,
+  MEDIA_WRAP_BYPASS_BYTES: 512000,         // 500KB 阈值，超过则走原生流直通
 
   // [阶段2-P0] 空 tag 图片短 TTL 缓存配置
   EMPTY_TAG_IMAGE_TTL_S: 90,          // 空 tag 匿名图片边缘缓存 TTL（秒）
@@ -1182,6 +1183,36 @@ function createUpstreamAbortController(clientSignal) {
   return { upstreamController, cleanup }
 }
 
+// 判定是否跳过 JS 包装，走原生流直通
+function shouldBypassWrap(resp, options = {}, cfg = {}) {
+  const status = resp.status || 0
+  const len = Number(resp.headers.get('content-length') || 0)
+  const ctype = (resp.headers.get('content-type') || '').toLowerCase()
+  const rangeReq = options.headers?.get?.('Range') || options.headers?.get?.('range')
+  const isMedia = ctype.includes('video/') || ctype.includes('audio/') || ctype.includes('application/octet-stream')
+  const large = len && len > (cfg.wrapBypassBytes || CONFIG.MEDIA_WRAP_BYPASS_BYTES)
+  const unknownSize = len === 0
+  const isRange = status === 206 || !!rangeReq
+  return isRange || (isMedia && (large || unknownSize))
+}
+
+// 首块探测：仅读取第一块数据验证上游活性
+async function probeFirstChunk(stream, cfg = {}) {
+  const reader = stream.getReader()
+  const timeoutMs = cfg.firstBodyTimeoutMs || CONFIG.MEDIA_FIRST_BODY_TIMEOUT_MS
+  let timer
+  try {
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('First body timeout')), timeoutMs)
+    })
+    const { done, value } = await Promise.race([reader.read(), timeout])
+    if (done || !value || !value.byteLength) throw new Error('Empty body')
+  } finally {
+    clearTimeout(timer)
+    try { reader.cancel('probe-complete') } catch {}
+  }
+}
+
 // 计算媒体请求重试退避时间
 function mediaRetryBackoffMs(attempt) {
   if (attempt === 0) {
@@ -1225,7 +1256,21 @@ async function fetchMediaWithRetries(url, options, cfg, clientSignal) {
         return { response: resp, body: resp.body, retryAttempt: attempt }
       }
 
-      // 包装响应体（不等待首块，让 pull 自然触发超时检测）
+      // 大媒体流走原生直通 + 首块探测（解决 CPU exceeded）
+      if (shouldBypassWrap(resp, options, cfg) && resp.body) {
+        const [probe, client] = resp.body.tee()
+        try {
+          await probeFirstChunk(probe, cfg)
+        } catch (error) {
+          try { client.cancel() } catch {}
+          try { upstreamController.abort(error.message) } catch {}
+          cleanup()
+          throw error
+        }
+        return { response: resp, body: client, retryAttempt: attempt }
+      }
+
+      // 小流仍走包装器（保留 idle watchdog）
       const wrapped = wrapMediaResponseBody(resp, upstreamController, clientSignal, cfg, cleanup)
       return { response: resp, body: wrapped.stream, retryAttempt: attempt }
     } catch (error) {
