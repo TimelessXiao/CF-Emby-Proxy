@@ -45,9 +45,14 @@ const CONFIG = {
 
   // [阶段1-P0] 媒体/Range 请求首包超时配置
   MEDIA_TTFB_TIMEOUT_MS: 8000,        // 首包超时 8s
-  MEDIA_TTFB_RETRY_MAX: 1,            // 最多重试 1 次
-  MEDIA_TTFB_RETRY_BACKOFF_MIN_MS: 100,  // 重试延迟最小值
-  MEDIA_TTFB_RETRY_BACKOFF_MAX_MS: 200,  // 重试延迟最大值
+  MEDIA_TTFB_RETRY_MAX: 2,            // 最多重试 2 次（覆盖首包/首块/网络错误）
+  MEDIA_FIRST_BODY_TIMEOUT_MS: 5000,  // headers 后首块数据超时
+  MEDIA_IDLE_TIMEOUT_MS: 12000,       // 播放过程中空闲 watchdog
+  MEDIA_PROGRESS_THRESHOLD_BYTES: 16384, // 16KB 累计后才重置 idle 计时，防止假存活
+  MEDIA_RETRY_BACKOFF_FIRST_MIN_MS: 200,   // 第1次重试抖动窗口
+  MEDIA_RETRY_BACKOFF_FIRST_MAX_MS: 400,
+  MEDIA_RETRY_BACKOFF_SECOND_MIN_MS: 400,  // 第2次重试抖动窗口
+  MEDIA_RETRY_BACKOFF_SECOND_MAX_MS: 800,
 
   // [阶段2-P0] 空 tag 图片短 TTL 缓存配置
   EMPTY_TAG_IMAGE_TTL_S: 90,          // 空 tag 匿名图片边缘缓存 TTL（秒）
@@ -371,8 +376,8 @@ app.all('*', async (c) => {
     cleanupHopByHopHeaders(proxyHeaders, false, true)
   }
 
-  //  Range 请求强制 identity 编码，避免 Range + gzip 导致的中间层异常
-  if (hasRange) {
+  //  媒体/Range 请求强制 identity 编码，避免 gzip 压缩导致的中间层异常
+  if (isVideo || hasRange) {
     proxyHeaders.set('Accept-Encoding', 'identity')
   }
 
@@ -489,6 +494,7 @@ app.all('*', async (c) => {
 
   try {
     let response;
+    let mediaBody = null;
 
     if (isPlaybackInfo && req.method === 'POST' && !hasRange && canBufferBody && hasToken) {
       const bodyHash = await sha256Hex(reqBody || '')
@@ -525,38 +531,23 @@ app.all('*', async (c) => {
 
     if (!response) {
       if ((isVideo || hasRange) && !isWebSocket) {
-        //  使用 TTFB 超时+单次重试机制，避免长时间 0.0kb/s 挂起
         const t0 = Date.now()
         subreqCount++
-        let retryAttempt = 0
-        try {
-          for (let attempt = 0; attempt <= CONFIG.MEDIA_TTFB_RETRY_MAX; attempt++) {
-            try {
-              if (attempt > 0) {
-                const jitter = CONFIG.MEDIA_TTFB_RETRY_BACKOFF_MIN_MS +
-                               Math.random() * (CONFIG.MEDIA_TTFB_RETRY_BACKOFF_MAX_MS - CONFIG.MEDIA_TTFB_RETRY_BACKOFF_MIN_MS)
-                await sleep(jitter)
-                retryAttempt = attempt
-              }
-
-              response = await fetchWithTtfbTimeout(
-                targetUrl.toString(),
-                fetchOptions,
-                CONFIG.MEDIA_TTFB_TIMEOUT_MS
-              )
-              break
-            } catch (error) {
-              if (error.name === 'AbortError' && attempt < CONFIG.MEDIA_TTFB_RETRY_MAX) {
-                continue
-              }
-              throw error
-            }
-          }
-        } catch (error) {
-          retryCount = retryAttempt
-          throw error
-        }
-        retryCount = retryAttempt
+        const mediaResult = await fetchMediaWithRetries(
+          targetUrl.toString(),
+          fetchOptions,
+          {
+            ttfbMs: CONFIG.MEDIA_TTFB_TIMEOUT_MS,
+            retryMax: CONFIG.MEDIA_TTFB_RETRY_MAX,
+            firstBodyTimeoutMs: CONFIG.MEDIA_FIRST_BODY_TIMEOUT_MS,
+            idleTimeoutMs: CONFIG.MEDIA_IDLE_TIMEOUT_MS,
+            progressThresholdBytes: CONFIG.MEDIA_PROGRESS_THRESHOLD_BYTES
+          },
+          req.signal
+        )
+        response = mediaResult.response
+        mediaBody = mediaResult.body
+        retryCount = mediaResult.retryAttempt
         upstreamMs += Date.now() - t0
       } else if (isWebSocket || (req.method === 'POST' && !(isPlaybackInfo && !hasRange))) {
         const t0 = Date.now()
@@ -678,7 +669,8 @@ app.all('*', async (c) => {
       })
     }
 
-    return new Response(response.body, {
+    const finalBody = mediaBody || response.body
+    return new Response(finalBody, {
       status: response.status,
       headers: resHeaders
     })
@@ -1115,17 +1107,17 @@ async function fetchWithTimeout(url, options, timeout) {
 }
 
 //  首包（TTFB）超时包装器：仅对"收到 response headers"阶段设置超时
-async function fetchWithTtfbTimeout(url, options, ttfbMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ttfbMs);
+async function fetchWithTtfbTimeout(url, options, ttfbMs, externalController = null) {
+  const controller = externalController || new AbortController()
+  const unlink = linkSignal(controller, options?.signal)
+  const timer = setTimeout(() => controller.abort(), ttfbMs)
 
   try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
-    clearTimeout(timer);
-    return response;
-  } catch (error) {
-    clearTimeout(timer);
-    throw error;
+    const response = await fetch(url, { ...options, signal: controller.signal })
+    return response
+  } finally {
+    clearTimeout(timer)
+    unlink()
   }
 }
 
@@ -1151,6 +1143,247 @@ async function fetchWithTtfbTimeoutAndRetry(url, options, ttfbMs, retryMax, back
   }
 
   throw lastError
+}
+
+// 桥接外部 AbortSignal 到内部 AbortController
+function linkSignal(controller, externalSignal) {
+  if (!externalSignal || externalSignal === controller.signal) return () => {}
+  if (externalSignal.aborted) {
+    try { controller.abort(externalSignal.reason) } catch { controller.abort() }
+    return () => {}
+  }
+  const onAbort = () => controller.abort(externalSignal.reason)
+  externalSignal.addEventListener('abort', onAbort)
+  return () => externalSignal.removeEventListener('abort', onAbort)
+}
+
+// 创建上游 AbortController 并桥接客户端取消信号
+function createUpstreamAbortController(clientSignal) {
+  const upstreamController = new AbortController()
+  let linked = false
+  const onClientAbort = () => upstreamController.abort(clientSignal?.reason)
+
+  if (clientSignal) {
+    if (clientSignal.aborted) {
+      upstreamController.abort(clientSignal.reason)
+    } else {
+      clientSignal.addEventListener('abort', onClientAbort)
+      linked = true
+    }
+  }
+
+  const cleanup = () => {
+    if (linked && clientSignal) {
+      clientSignal.removeEventListener('abort', onClientAbort)
+      linked = false
+    }
+  }
+
+  return { upstreamController, cleanup }
+}
+
+// 计算媒体请求重试退避时间
+function mediaRetryBackoffMs(attempt) {
+  if (attempt === 0) {
+    return CONFIG.MEDIA_RETRY_BACKOFF_FIRST_MIN_MS +
+      Math.random() * (CONFIG.MEDIA_RETRY_BACKOFF_FIRST_MAX_MS - CONFIG.MEDIA_RETRY_BACKOFF_FIRST_MIN_MS)
+  }
+  return CONFIG.MEDIA_RETRY_BACKOFF_SECOND_MIN_MS +
+    Math.random() * (CONFIG.MEDIA_RETRY_BACKOFF_SECOND_MAX_MS - CONFIG.MEDIA_RETRY_BACKOFF_SECOND_MIN_MS)
+}
+
+// 媒体请求重试包装器（覆盖 TTFB/首块/5xx/网络错误）
+async function fetchMediaWithRetries(url, options, cfg, clientSignal) {
+  let lastResponse = null
+  let lastError = null
+
+  for (let attempt = 0; attempt <= cfg.retryMax; attempt++) {
+    const { upstreamController, cleanup } = createUpstreamAbortController(clientSignal)
+    try {
+      const resp = await fetchWithTtfbTimeout(
+        url,
+        { ...options, signal: upstreamController.signal },
+        cfg.ttfbMs,
+        upstreamController
+      )
+
+      lastResponse = resp
+      const method = (options.method || 'GET').toUpperCase()
+      const status = resp.status || 0
+
+      // 5xx 可重试（仅幂等请求）
+      if (status >= 500 && ['GET', 'HEAD'].includes(method) && attempt < cfg.retryMax) {
+        try { resp.body?.cancel?.() } catch {}
+        cleanup()
+        await sleep(mediaRetryBackoffMs(attempt))
+        continue
+      }
+
+      // 4xx 不重试
+      if (status >= 400 && status < 500) {
+        cleanup()
+        return { response: resp, body: resp.body, retryAttempt: attempt }
+      }
+
+      // 包装响应体（不等待首块，让 pull 自然触发超时检测）
+      const wrapped = wrapMediaResponseBody(resp, upstreamController, clientSignal, cfg, cleanup)
+      return { response: resp, body: wrapped.stream, retryAttempt: attempt }
+    } catch (error) {
+      lastError = error
+      const method = (options.method || 'GET').toUpperCase()
+      const isIdempotent = method === 'GET' || method === 'HEAD'
+      const retryable = isIdempotent && attempt < cfg.retryMax && (
+        error.name === 'AbortError' ||
+        error.message === 'Timeout' ||
+        /timeout/i.test(error?.message || '') ||
+        error.code === 23 ||
+        (error.message && error.message.startsWith('First body timeout')) ||
+        (error.message && error.message.startsWith('Idle timeout'))
+      )
+
+      cleanup()
+
+      if (retryable) {
+        await sleep(mediaRetryBackoffMs(attempt))
+        continue
+      }
+
+      throw error
+    }
+  }
+
+  if (lastResponse) {
+    return { response: lastResponse, body: lastResponse.body, retryAttempt: cfg.retryMax }
+  }
+
+  throw lastError || new Error('Media fetch failed')
+}
+
+// 媒体响应体包装器（首块超时 + 空闲监控 + 进度阈值 + 客户端取消传播）
+function wrapMediaResponseBody(upstreamResp, upstreamController, clientSignal, cfg = {}, abortCleanup = () => {}) {
+  const reader = upstreamResp.body?.getReader?.()
+  const firstBodyTimeoutMs = cfg.firstBodyTimeoutMs || CONFIG.MEDIA_FIRST_BODY_TIMEOUT_MS
+  const idleTimeoutMs = cfg.idleTimeoutMs || CONFIG.MEDIA_IDLE_TIMEOUT_MS
+  const progressThreshold = cfg.progressThresholdBytes || CONFIG.MEDIA_PROGRESS_THRESHOLD_BYTES
+
+  let bytesSinceReset = 0
+  let cancelled = false
+  let settledFirst = false
+  let idleTimer = null
+  let firstTimer = null
+  let onClientAbort = null
+
+  let resolveFirst, rejectFirst
+  const firstChunkPromise = new Promise((resolve, reject) => {
+    resolveFirst = resolve
+    rejectFirst = reject
+  })
+  // 防止 unhandled rejection（promise 未被外部消费时）
+  firstChunkPromise.catch(() => {})
+
+  const clearTimers = () => {
+    if (firstTimer) { clearTimeout(firstTimer); firstTimer = null }
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null }
+  }
+
+  const cleanup = () => {
+    try { abortCleanup?.() } catch {}
+    if (clientSignal && onClientAbort) {
+      try { clientSignal.removeEventListener('abort', onClientAbort) } catch {}
+    }
+    clearTimers()
+  }
+
+  const cancel = (reason) => {
+    if (cancelled) return
+    cancelled = true
+    clearTimers()
+    // 确保 firstChunkPromise 被 settle，避免永久挂起
+    if (!settledFirst) {
+      settledFirst = true
+      rejectFirst?.(new Error(typeof reason === 'string' ? reason : 'Cancelled'))
+    }
+    try { upstreamController?.abort?.(reason) } catch {}
+    try { reader?.cancel?.() } catch {}
+    cleanup()
+  }
+
+  onClientAbort = () => cancel(clientSignal?.reason || 'client-abort')
+  if (clientSignal) {
+    if (clientSignal.aborted) {
+      cancel(clientSignal.reason)
+    } else {
+      clientSignal.addEventListener('abort', onClientAbort)
+    }
+  }
+
+  const startIdleTimer = () => {
+    if (idleTimeoutMs <= 0) return
+    if (idleTimer) clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => {
+      if (cancelled) return
+      if (!settledFirst) { rejectFirst?.(new Error('Idle timeout')) }
+      cancel('Idle timeout')
+    }, idleTimeoutMs)
+  }
+
+  firstTimer = setTimeout(() => {
+    if (cancelled) return
+    if (!settledFirst) { rejectFirst?.(new Error('First body timeout')) }
+    cancel('First body timeout')
+  }, firstBodyTimeoutMs)
+
+  const stream = new ReadableStream({
+    async pull(controller) {
+      if (!reader) {
+        if (!settledFirst) { settledFirst = true; resolveFirst?.() }
+        cleanup()
+        controller.close()
+        return
+      }
+
+      try {
+        const { done, value } = await reader.read()
+        if (cancelled) return
+
+        if (done) {
+          clearTimers()
+          cleanup()
+          if (!settledFirst) { settledFirst = true; resolveFirst?.() }
+          controller.close()
+          return
+        }
+
+        if (!settledFirst) {
+          settledFirst = true
+          resolveFirst?.()
+          if (firstTimer) { clearTimeout(firstTimer); firstTimer = null }
+          startIdleTimer()
+        }
+
+        const chunkSize = value?.byteLength || 0
+        bytesSinceReset += chunkSize
+        controller.enqueue(value)
+
+        if (bytesSinceReset >= progressThreshold) {
+          bytesSinceReset = 0
+          startIdleTimer()
+        } else if (!idleTimer) {
+          startIdleTimer()
+        }
+      } catch (error) {
+        if (cancelled) return
+        if (!settledFirst) { settledFirst = true; rejectFirst?.(error) }
+        cancel(error)
+        try { controller.error(error) } catch {}
+      }
+    },
+    cancel(reason) {
+      cancel(reason)
+    }
+  })
+
+  return { stream, cancel, firstChunkPromise, cleanup }
 }
 
 //  检测是否为匿名图片请求（无认证令牌）
