@@ -47,8 +47,8 @@ const CONFIG = {
   ROUTE_REFRESH_DEDUP_TTL_S: 5,    // 刷新去重窗口 (秒)
 
   // 媒体/Range 请求首包超时配置
-  MEDIA_TTFB_TIMEOUT_MS: 8000,        // 首包超时 8s
-  MEDIA_TTFB_RETRY_MAX: 2,            // 最多重试 2 次（覆盖首包/首块/网络错误）
+  MEDIA_TTFB_TIMEOUT_MS: 15000,       // 首包超时 15s（慢源兼容）
+  MEDIA_TTFB_RETRY_MAX: 1,            // 最多重试 1 次（降低 free-tier CPU）
   MEDIA_FIRST_BODY_TIMEOUT_MS: 5000,  // headers 后首块数据超时
   MEDIA_IDLE_TIMEOUT_MS: 12000,       // 播放过程中空闲 watchdog
   MEDIA_PROGRESS_THRESHOLD_BYTES: 16384, // 16KB 累计后才重置 idle 计时，防止假存活
@@ -510,6 +510,7 @@ app.all('*', async (c) => {
   let upstreamMs = 0
   let retryCount = 0
   let subreqCount = 0
+  let streamMode = null
   let cacheHit = 0
 
   try {
@@ -579,6 +580,7 @@ app.all('*', async (c) => {
         response = mediaResult.response
         mediaBody = mediaResult.body
         retryCount = mediaResult.retryAttempt
+        streamMode = mediaResult.mode
         upstreamMs += Date.now() - t0
       } else if (isWebSocket || (req.method === 'POST' && !(isPlaybackInfo && !hasRange))) {
         const t0 = Date.now()
@@ -614,6 +616,14 @@ app.all('*', async (c) => {
     resHeaders.delete('content-security-policy')
     resHeaders.delete('clear-site-data')
     resHeaders.set('access-control-allow-origin', '*')
+
+    // P3: 媒体请求 debug headers（仅 DEBUG 或 x-proxy-debug:1 时输出）
+    const wantDebug = DEBUG || req.headers.get('x-proxy-debug') === '1'
+    if (wantDebug && streamMode) {
+      resHeaders.set('X-Proxy-Stream-Mode', streamMode)
+      resHeaders.set('X-Proxy-Retry', String(retryCount))
+      resHeaders.set('X-Proxy-Upstream-Status', String(response.status))
+    }
 
     // Browser playback is out of scope
     if (CONFIG.ENABLE_HOP_BY_HOP_KEEPALIVE && isVideo && !isWebSocket && !isHttp2) {
@@ -1290,16 +1300,29 @@ function createUpstreamAbortController(clientSignal) {
 }
 
 // 判定是否跳过 JS 包装，走原生流直通
-function shouldBypassWrap(resp, options = {}, cfg = {}) {
+function shouldBypassWrap(resp, options = {}, cfg = {}, url = '') {
   const status = resp.status || 0
-  const len = Number(resp.headers.get('content-length') || 0)
-  const ctype = (resp.headers.get('content-type') || '').toLowerCase()
+  const ctype = (resp.headers.get('content-type') || '').toLowerCase().split(';')[0].trim()
   const rangeReq = options.headers?.get?.('Range') || options.headers?.get?.('range')
-  const isMedia = ctype.includes('video/') || ctype.includes('audio/') || ctype.includes('application/octet-stream')
-  const large = len && len > (cfg.wrapBypassBytes || CONFIG.MEDIA_WRAP_BYPASS_BYTES)
-  const unknownSize = len === 0
   const isRange = status === 206 || !!rangeReq
-  return isRange || (isMedia && (large || unknownSize))
+
+  // 媒体 MIME 类型检测（含 HLS/DASH/MPEG-TS）
+  const isMediaMime = ctype.startsWith('video/') ||
+                      ctype.startsWith('audio/') ||
+                      ctype === 'application/vnd.apple.mpegurl' ||
+                      ctype === 'application/x-mpegurl' ||
+                      ctype === 'video/mp2t' ||
+                      ctype === 'application/dash+xml'
+
+  // octet-stream 需辅助信号判定
+  let isOctetMedia = false
+  if (ctype === 'application/octet-stream') {
+    // 支持带查询参数的 URL（如 ?static=true）
+    const mediaExt = /\.(mp4|mkv|ts|m3u8|mpd|mov|avi|flv|webm|mp3|aac|flac|wav|m4a|ogg|opus|m4s|cmf|ismv)($|\?)/i
+    isOctetMedia = isRange || mediaExt.test(url)
+  }
+
+  return isRange || isMediaMime || isOctetMedia
 }
 
 // 首块探测：仅读取第一块数据验证上游活性
@@ -1359,26 +1382,17 @@ async function fetchMediaWithRetries(url, options, cfg, clientSignal) {
       // 4xx 不重试
       if (status >= 400 && status < 500) {
         cleanup()
-        return { response: resp, body: resp.body, retryAttempt: attempt }
+        return { response: resp, body: resp.body, retryAttempt: attempt, mode: 'error-4xx' }
       }
 
-      // 大媒体流走原生直通 + 首块探测（解决 CPU exceeded）
-      if (shouldBypassWrap(resp, options, cfg) && resp.body) {
-        const [probe, client] = resp.body.tee()
-        try {
-          await probeFirstChunk(probe, cfg)
-        } catch (error) {
-          try { client.cancel() } catch {}
-          try { upstreamController.abort(error.message) } catch {}
-          cleanup()
-          throw error
-        }
-        return { response: resp, body: client, retryAttempt: attempt }
+      // 媒体直通：headers 到达后立即返回，不阻塞首块探测
+      if (shouldBypassWrap(resp, options, cfg, url) && resp.body) {
+        return { response: resp, body: resp.body, retryAttempt: attempt, mode: 'bypass' }
       }
 
-      // 小流仍走包装器（保留 idle watchdog）
+      // 非媒体流走包装器（保留 idle watchdog）
       const wrapped = wrapMediaResponseBody(resp, upstreamController, clientSignal, cfg, cleanup)
-      return { response: resp, body: wrapped.stream, retryAttempt: attempt }
+      return { response: resp, body: wrapped.stream, retryAttempt: attempt, mode: 'wrap' }
     } catch (error) {
       lastError = error
       const method = (options.method || 'GET').toUpperCase()
@@ -1404,7 +1418,7 @@ async function fetchMediaWithRetries(url, options, cfg, clientSignal) {
   }
 
   if (lastResponse) {
-    return { response: lastResponse, body: lastResponse.body, retryAttempt: cfg.retryMax }
+    return { response: lastResponse, body: lastResponse.body, retryAttempt: cfg.retryMax, mode: 'fallback' }
   }
 
   throw lastError || new Error('Media fetch failed')
