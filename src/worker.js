@@ -12,6 +12,9 @@ const CONFIG = {
   // 2. 匹配 Emby 特有的无后缀图片路径 (/Images/Primary, /Images/Backdrop 等)
   STATIC_REGEX: /(\.(jpg|jpeg|png|gif|css|js|ico|svg|webp|woff|woff2)|(\/Images\/(Primary|Backdrop|Logo|Thumb|Banner|Art)))/i,
 
+  // Emby Items 图片路径：/Items/{id}/Images/{type}[/{index}]
+  ITEM_IMAGE_REGEX: /\/Items\/[^\/]+\/Images\/[^\/]+/i,
+
   // 视频流 (直连，不缓存，不重试)
   VIDEO_REGEX: /(\/Videos\/|\/Items\/.*\/Download|\/Items\/.*\/Stream)/i,
 
@@ -43,7 +46,7 @@ const CONFIG = {
   ROUTE_CACHE_HOST: 'route-cache.local',  // L2 缓存 key 隔离域名
   ROUTE_REFRESH_DEDUP_TTL_S: 5,    // 刷新去重窗口 (秒)
 
-  // [阶段1-P0] 媒体/Range 请求首包超时配置
+  // 媒体/Range 请求首包超时配置
   MEDIA_TTFB_TIMEOUT_MS: 8000,        // 首包超时 8s
   MEDIA_TTFB_RETRY_MAX: 2,            // 最多重试 2 次（覆盖首包/首块/网络错误）
   MEDIA_FIRST_BODY_TIMEOUT_MS: 5000,  // headers 后首块数据超时
@@ -55,10 +58,10 @@ const CONFIG = {
   MEDIA_RETRY_BACKOFF_SECOND_MAX_MS: 800,
   MEDIA_WRAP_BYPASS_BYTES: 512000,         // 500KB 阈值，超过则走原生流直通
 
-  // [阶段2-P0] 空 tag 图片短 TTL 缓存配置
+  // 空 tag 图片短 TTL 缓存配置
   EMPTY_TAG_IMAGE_TTL_S: 90,          // 空 tag 匿名图片边缘缓存 TTL（秒）
 
-  // [阶段4-P1] DEBUG 采样率（防止 header 膨胀）
+  // DEBUG 采样率（防止 header 膨胀）
   DEBUG_SAMPLE_RATE: 0.1              // 采样 10% 的请求用于 DEBUG 输出
 }
 
@@ -80,6 +83,9 @@ const PLAYER_TOKENS = [
   'bravia',       // Sony TV
   'mitv'          // Xiaomi TV
 ]
+
+// 浏览器 UA 特征（用于区分客户端类型，仅在 playerHint 未命中时使用）
+const BROWSER_REGEX = /(Mozilla|Chrome|Safari|Firefox|Edg|OPR|Brave)/i
 
 // Cache Key 去噪白名单
 const CACHE_QUERY_ALLOWLIST = new Set([
@@ -352,8 +358,13 @@ app.all('*', async (c) => {
     }
   }
 
-  // --- 判别请求类型 ---
-  const isStatic = CONFIG.STATIC_REGEX.test(url.pathname)
+  // 判别请求类型
+  const isStaticAsset = CONFIG.STATIC_REGEX.test(url.pathname)
+  const isItemImage = CONFIG.ITEM_IMAGE_REGEX.test(url.pathname)
+  // 限制可缓存图片：Items 图片路径 或 legacy /Images/{type} 路径
+  const isLegacyImage = /^\/Images\/(Primary|Backdrop|Logo|Thumb|Banner|Art|Still|Box|Screenshot|Chapter|Menu|Disc|Poster)/i.test(url.pathname)
+  const isImage = isItemImage || isLegacyImage
+  const isStatic = isStaticAsset || isImage
   const isVideo = CONFIG.VIDEO_REGEX.test(url.pathname)
   const isApiCacheable = req.method === 'GET' &&
                          CONFIG.API_CACHE_REGEX.test(url.pathname) &&
@@ -407,9 +418,9 @@ app.all('*', async (c) => {
   const hasRealToken = tokenResult?.hasRealToken || false
   const hasToken = tokenHash && hasRealToken
 
-  // --- Cloudflare 策略配置 ---
+  // Cloudflare 策略配置
   const cfConfig = {
-    cacheEverything: (isStatic && (hasToken || isTaggedArtwork)),
+    cacheEverything: (isImage && (hasToken || isTaggedArtwork)),
     cacheTtl: 0,
     cacheTtlByStatus: isApiCacheable ? { "200-299": 10 } : null,
     polish: isStatic ? 'lossy' : 'off',
@@ -419,7 +430,7 @@ app.all('*', async (c) => {
     apps: false,
   }
 
-  if (isStatic && (hasToken || isTaggedArtwork)) {
+  if (isImage && (hasToken || isTaggedArtwork)) {
     const keyUrl = new URL(targetUrl)
     if (keyUrl.searchParams.sort) keyUrl.searchParams.sort()
 
@@ -435,7 +446,7 @@ app.all('*', async (c) => {
   }
 
   //  空 tag 匿名图片短 TTL 缓存（抗抖动，减少切集时 500 错误）
-  const isEmptyTag = isStatic && isEmptyTagArtwork(url) && isAnonymousImageRequest(req, url)
+  const isEmptyTag = isImage && isEmptyTagArtwork(url) && isAnonymousImageRequest(req, url)
   if (isEmptyTag && req.method === 'GET') {
     const keyUrl = new URL(targetUrl)
     if (keyUrl.searchParams.sort) keyUrl.searchParams.sort()
@@ -556,7 +567,7 @@ app.all('*', async (c) => {
         response = await fetch(targetUrl.toString(), fetchOptions)
         upstreamMs += Date.now() - t0
       } else {
-        // [P0-1] Critical Path 逻辑更新：API Cacheable 的请求均视为关键路径
+        // Critical Path 逻辑更新：API Cacheable 的请求均视为关键路径
         const isCriticalPath = (isM3U8 && req.method === 'GET') || (isApiCacheable && req.method === 'GET') || (isPlaybackInfo && req.method === 'POST')
 
         if (isCriticalPath) {
@@ -565,8 +576,8 @@ app.all('*', async (c) => {
           response = await fetchWithTimeout(targetUrl.toString(), fetchOptions, CONFIG.CRITICAL_TIMEOUT)
           upstreamMs += Date.now() - t0
         } else {
-          // Browser playback is out of scope
-          const timeout = CONFIG.API_TIMEOUT
+          // 图片请求使用 CRITICAL_TIMEOUT，其他 API 使用 API_TIMEOUT
+          const timeout = isImage ? CONFIG.CRITICAL_TIMEOUT : CONFIG.API_TIMEOUT
           const t0 = Date.now()
           subreqCount++
           response = await fetchWithTimeout(targetUrl.toString(), fetchOptions, timeout)
@@ -599,7 +610,7 @@ app.all('*', async (c) => {
       resHeaders.set('Cache-Control', `private, max-age=${CONFIG.M3U8_TTL}`)
     }
 
-    if (isStatic && response.status === 200) {
+    if (isImage && response.status === 200) {
         if (hasToken || isTaggedArtwork) {
             resHeaders.set('Cache-Control', 'public, max-age=31536000, immutable')
             resHeaders.delete('Pragma')
@@ -650,23 +661,38 @@ app.all('*', async (c) => {
         return new Response(null, { status: response.status, headers: resHeaders })
     }
 
-    //  图片 5xx 降级：返回 1x1 透明 PNG，避免 UI 破损图标
-    if (isStatic && response.status >= 500 && /\/Images\//i.test(url.pathname)) {
-      const transparentPixel = new Uint8Array([
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
-        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
-        0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
-        0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
-        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82
-      ])
-      return new Response(transparentPixel.buffer, {
-        status: 200,
-        headers: new Headers({
-          'Content-Type': 'image/png',
-          'Cache-Control': 'no-store',
-          'Content-Length': transparentPixel.length.toString()
+    //  图片 5xx 处理：区分 Native 客户端与浏览器
+    //  Native 客户端需要接收真实 5xx 以触发重试；浏览器可降级透明 PNG
+    if (isImage && response.status >= 500) {
+      const isNativeClient = !!playerHint
+      const isLikelyBrowser = !isNativeClient && BROWSER_REGEX.test(ua)
+
+      if (isLikelyBrowser) {
+        // 浏览器：返回透明 PNG 避免破损图标
+        const transparentPixel = new Uint8Array([
+          0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+          0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+          0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+          0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+          0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+          0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82
+        ])
+        return new Response(transparentPixel.buffer, {
+          status: 200,
+          headers: new Headers({
+            'Content-Type': 'image/png',
+            'Cache-Control': 'no-store',
+            'Content-Length': transparentPixel.length.toString()
+          })
         })
+      }
+
+      // Native 客户端或未知客户端：透传 5xx 以触发重试
+      resHeaders.set('Cache-Control', 'no-store')
+      const safeBody = response.body || null
+      return new Response(safeBody, {
+        status: response.status,
+        headers: resHeaders
       })
     }
 
@@ -678,11 +704,24 @@ app.all('*', async (c) => {
 
   } catch (error) {
     //  错误语义化：区分 Timeout (504) 与 Bad Gateway (502)
-    const isTimeout = error.name === 'AbortError' || error.message === 'Timeout' || (error.code === 23); // 23 is Cloudflare-specific generic timeout code sometimes
+    const isTimeout = error.name === 'AbortError' || error.message === 'Timeout' || (error.code === 23);
     const status = isTimeout ? 504 : 502
     const statusText = isTimeout ? 'Gateway Timeout' : 'Bad Gateway'
 
-    //  增加诊断 Header：对于视频/Range 使用正确的 TTFB 超时值
+    // 图片请求：返回空 body + 5xx，避免 JSON 污染；客户端可重试
+    if (isImage) {
+      const imgErrorHeaders = new Headers({
+        'Content-Type': 'image/png',
+        'Cache-Control': 'no-store'
+      })
+      if (DEBUG) {
+        const timeoutMs = CONFIG.CRITICAL_TIMEOUT
+        imgErrorHeaders.set('X-Proxy-Error', isTimeout ? `Timeout-${timeoutMs}ms` : `Upstream-${error.message}`)
+      }
+      return new Response(null, { status, headers: imgErrorHeaders })
+    }
+
+    //  诊断 Header：对于视频/Range 使用正确的 TTFB 超时值
     const errorHeaders = new Headers({ 'Content-Type': 'application/json' })
     if (DEBUG) {
       const timeoutMs = (isVideo || hasRange) ? CONFIG.MEDIA_TTFB_TIMEOUT_MS : CONFIG.CRITICAL_TIMEOUT
@@ -1507,7 +1546,7 @@ async function buildTokenKey(req, url) {
   const headers = req.headers
   const params = url.searchParams
 
-  // [P0-4] 支持 Query Token (X-Emby-Token / X-MediaBrowser-Token)
+  // 支持 Query Token (X-Emby-Token / X-MediaBrowser-Token)
   let token = headers.get('X-Emby-Token') ||
               headers.get('X-MediaBrowser-Token') ||
               params.get('api_key') ||
