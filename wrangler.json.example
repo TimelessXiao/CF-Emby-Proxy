@@ -15,7 +15,9 @@
   ],
   "vars": {
     "UPSTREAM_URL": "https://your-emby-server.com",
-    "DEBUG": "false"
+    "DEBUG": "false",
+    "DEBUG_LOG_NON_2XX": "false",
+    "DEBUG_LOG_REDACT": "true"
   },
   "observability": {
     "enabled": false,

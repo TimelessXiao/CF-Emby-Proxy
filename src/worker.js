@@ -497,6 +497,14 @@ app.all('*', async (c) => {
   }
 
   const DEBUG = c.env?.DEBUG === 'true' || c.env?.DEBUG === '1'
+  const LOG_NON_2XX = DEBUG && (c.env?.DEBUG_LOG_NON_2XX === 'true' || c.env?.DEBUG_LOG_NON_2XX === '1')
+  const LOG_REDACT = c.env?.DEBUG_LOG_REDACT !== 'false'
+  const dbg = DEBUG ? new Debugger({
+    DEBUG_SAMPLE_RATE: CONFIG.DEBUG_SAMPLE_RATE,
+    DEBUG_LOG_NON_2XX: LOG_NON_2XX,
+    DEBUG_LOG_REDACT: LOG_REDACT
+  }) : null
+  let detailedLogged = false
   const kind = isVideo ? 'media' : (hasRange ? 'range' : (isM3U8 ? 'm3u8' : (isPlaybackInfo ? 'playbackinfo' : 'api')))
   let kvReadMs = routeKvMs || 0
   let upstreamMs = 0
@@ -520,6 +528,17 @@ app.all('*', async (c) => {
       const cached = await cache.match(cacheReq)
       if (cached) {
         cacheHit = 1
+        // PlaybackInfo cache-hit 非 2xx 日志
+        if (dbg && LOG_NON_2XX && !detailedLogged && (cached.status < 200 || cached.status >= 300)) {
+          dbg.logDetailed({
+            req,
+            res: { status: cached.status, headers: cached.headers },
+            metrics: { kind, kvReadMs, cacheHit, upstreamMs, retryCount, subreqCount },
+            context: { isVideo, hasRange, note: 'playbackinfo-cache-hit' },
+            env: c.env
+          })
+          detailedLogged = true
+        }
         return new Response(cached.body, { status: cached.status, headers: cached.headers })
       }
 
@@ -633,8 +652,7 @@ app.all('*', async (c) => {
       resHeaders.delete('Expires')
     }
 
-    if (DEBUG) {
-      const dbg = new Debugger({ DEBUG_SAMPLE_RATE: CONFIG.DEBUG_SAMPLE_RATE })
+    if (dbg) {
       dbg.inject(resHeaders, {
         kind, kvReadMs, cacheHit, upstreamMs, retryCount, subreqCount, playerHint
       }, {
@@ -644,6 +662,18 @@ app.all('*', async (c) => {
         isVideo,
         hasRange
       })
+
+      // 非 2xx 强制详细日志
+      if (LOG_NON_2XX && !detailedLogged && (response.status < 200 || response.status >= 300)) {
+        dbg.logDetailed({
+          req,
+          res: { status: response.status, headers: resHeaders },
+          metrics: { kind, kvReadMs, cacheHit, upstreamMs, retryCount, subreqCount, playerHint },
+          context: { isVideo, hasRange, subdomain, upstreamBase: targetUrl.origin },
+          env: c.env
+        })
+        detailedLogged = true
+      }
     }
 
     if (response.status === 101) {
@@ -664,6 +694,18 @@ app.all('*', async (c) => {
     //  图片 5xx 处理：区分 Native 客户端与浏览器
     //  Native 客户端需要接收真实 5xx 以触发重试；浏览器可降级透明 PNG
     if (isImage && response.status >= 500) {
+      // 图片 5xx 详细日志
+      if (dbg && LOG_NON_2XX && !detailedLogged) {
+        dbg.logDetailed({
+          req,
+          res: { status: response.status, headers: resHeaders },
+          metrics: { kind, kvReadMs, cacheHit, upstreamMs, retryCount, subreqCount },
+          context: { isVideo, hasRange, note: 'image-5xx' },
+          env: c.env
+        })
+        detailedLogged = true
+      }
+
       const isNativeClient = !!playerHint
       const isLikelyBrowser = !isNativeClient && BROWSER_REGEX.test(ua)
 
@@ -718,6 +760,18 @@ app.all('*', async (c) => {
         const timeoutMs = CONFIG.CRITICAL_TIMEOUT
         imgErrorHeaders.set('X-Proxy-Error', isTimeout ? `Timeout-${timeoutMs}ms` : `Upstream-${error.message}`)
       }
+      // 图片异常详细日志
+      if (dbg && !detailedLogged) {
+        dbg.logDetailed({
+          req,
+          res: { status, headers: imgErrorHeaders },
+          metrics: { kind, kvReadMs, cacheHit, upstreamMs, retryCount, subreqCount },
+          context: { isVideo, hasRange, isTimeout, note: 'image-catch' },
+          error,
+          env: c.env
+        })
+        detailedLogged = true
+      }
       return new Response(null, { status, headers: imgErrorHeaders })
     }
 
@@ -726,6 +780,19 @@ app.all('*', async (c) => {
     if (DEBUG) {
       const timeoutMs = (isVideo || hasRange) ? CONFIG.MEDIA_TTFB_TIMEOUT_MS : CONFIG.CRITICAL_TIMEOUT
       errorHeaders.set('X-Proxy-Error', isTimeout ? `Timeout-${timeoutMs}ms` : `Upstream-${error.message}`)
+    }
+
+    // 通用异常详细日志
+    if (dbg && !detailedLogged) {
+      dbg.logDetailed({
+        req,
+        res: { status, headers: errorHeaders },
+        metrics: { kind, kvReadMs, cacheHit, upstreamMs, retryCount, subreqCount },
+        context: { isVideo, hasRange, isTimeout },
+        error,
+        env: c.env
+      })
+      detailedLogged = true
     }
 
     const message = DEBUG ? `Proxy Error: ${error?.message || String(error)}` : statusText
