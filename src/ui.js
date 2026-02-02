@@ -5,58 +5,82 @@ export const MANAGE_UI_HTML = `<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CF Emby 代理管理器</title>
   <style>
+    :root {
+      --c-primary: #52B54B;
+      --c-primary-hover: #45a03e;
+      --c-primary-glow: rgba(82,181,75,0.25);
+      --c-danger: #ef4444;
+      --c-danger-glow: rgba(239,68,68,0.2);
+      --c-bg: #0a0e14;
+      --c-surface: rgba(15,23,35,0.8);
+      --c-card: rgba(20,30,45,0.65);
+      --c-border: rgba(82,181,75,0.12);
+      --c-border-subtle: rgba(255,255,255,0.06);
+      --c-text: #f1f5f9;
+      --c-muted: #94a3b8;
+      --radius: 16px;
+      --radius-sm: 10px;
+      --shadow: 0 4px 24px rgba(0,0,0,0.4);
+      --transition: 0.2s cubic-bezier(0.4,0,0.2,1);
+    }
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: system-ui, -apple-system, sans-serif; background: #101010; color: #E0E0E0; padding: 20px; }
-    .container { max-width: 1200px; margin: 0 auto; }
-    h1 { color: #52B54B; margin-bottom: 8px; }
-    .subtitle { color: #A0A0A0; margin-bottom: 24px; font-size: 14px; }
-    .card { background: #202020; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
-    .card h2 { color: #52B54B; margin-bottom: 16px; font-size: 18px; }
-    .form-group { margin-bottom: 16px; }
-    label { display: block; margin-bottom: 4px; font-size: 14px; color: #A0A0A0; }
-    input, textarea { width: 100%; padding: 10px; background: #2a2a2a; border: 1px solid #333; border-radius: 4px; color: #E0E0E0; font-size: 14px; }
-    input:focus, textarea:focus { outline: none; border-color: #52B54B; }
-    button { padding: 10px 20px; background: #52B54B; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 500; }
-    button:hover { background: #43943d; }
-    button.secondary { background: #333; }
-    button.secondary:hover { background: #444; }
-    button.danger { background: #E53935; }
-    button.danger:hover { background: #c62828; }
-    .actions { display: flex; gap: 8px; margin-bottom: 16px; }
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; background: linear-gradient(145deg, #0a0e14 0%, #0d1520 50%, #0a0e14 100%); color: var(--c-text); padding: 40px 24px; min-height: 100vh; }
+    .container { max-width: 960px; margin: 0 auto; }
+    h1 { color: var(--c-primary); margin-bottom: 6px; font-size: 1.625rem; font-weight: 600; text-shadow: 0 0 20px var(--c-primary-glow); }
+    .subtitle { color: var(--c-muted); margin-bottom: 32px; font-size: 13px; letter-spacing: 0.3px; }
+    .card { background: var(--c-card); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid var(--c-border); border-radius: var(--radius); padding: 24px; margin-bottom: 20px; box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,0.04); }
+    .card h2 { color: #fff; margin-bottom: 20px; font-size: 0.9375rem; font-weight: 500; padding-bottom: 14px; border-bottom: 1px solid var(--c-border-subtle); }
+    .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; padding-bottom: 14px; border-bottom: 1px solid var(--c-border-subtle); min-height: 24px; }
+    .card-header h2 { margin: 0; padding: 0; border: none; }
+    .bulk-actions { display: flex; align-items: center; gap: 12px; }
+    .bulk-actions span { color: var(--c-muted); font-size: 12px; white-space: nowrap; }
+    .bulk-actions .btn-sm { padding: 6px 14px; min-height: auto; }
+    .form-group { margin-bottom: 18px; }
+    label { display: block; margin-bottom: 8px; font-size: 12px; color: var(--c-muted); font-weight: 500; letter-spacing: 0.3px; }
+    input, textarea { width: 100%; padding: 12px 16px; background: rgba(0,0,0,0.35); border: 1px solid var(--c-border-subtle); border-radius: var(--radius-sm); color: #fff; font-size: 14px; transition: var(--transition); }
+    input:focus, textarea:focus { outline: none; border-color: var(--c-primary); box-shadow: 0 0 0 3px var(--c-primary-glow), inset 0 1px 2px rgba(0,0,0,0.2); }
+    button { padding: 11px 22px; background: var(--c-primary); color: #0a0e14; border: none; border-radius: var(--radius-sm); cursor: pointer; font-size: 13px; font-weight: 600; transition: var(--transition); }
+    button:hover { background: var(--c-primary-hover); box-shadow: 0 0 20px var(--c-primary-glow); }
+    button:active { transform: scale(0.98); }
+    button.secondary { background: rgba(255,255,255,0.05); color: var(--c-text); border: 1px solid var(--c-border-subtle); }
+    button.secondary:hover { background: rgba(255,255,255,0.1); border-color: var(--c-border); }
+    button.danger { background: rgba(239,68,68,0.1); color: var(--c-danger); border: 1px solid rgba(239,68,68,0.2); }
+    button.danger:hover { background: var(--c-danger); color: #fff; box-shadow: 0 0 20px var(--c-danger-glow); }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
     table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 12px; border-bottom: 1px solid #333; }
-    th { color: #52B54B; font-weight: 500; }
-    td { color: #E0E0E0; }
+    th, td { text-align: left; padding: 14px 12px; border-bottom: 1px solid var(--c-border-subtle); }
+    th { color: var(--c-muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px; }
+    td { color: var(--c-text); transition: var(--transition); }
+    tbody tr { transition: var(--transition); }
+    tbody tr:hover { background: rgba(82,181,75,0.04); }
+    tbody tr:hover td { border-color: var(--c-border); }
     .btn-group { display: flex; gap: 8px; }
-    .btn-sm { padding: 6px 12px; font-size: 13px; }
-    #toast { position: fixed; top: 20px; right: 20px; background: #52B54B; color: white; padding: 16px 20px; border-radius: 4px; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
-    #toast.error { background: #E53935; }
-    .loading { opacity: 0.6; pointer-events: none; }
-    input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; accent-color: #52B54B; }
-    .bulk-bar {
-      position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
-      background: #333; border: 1px solid #52B54B;
-      padding: 12px 24px; border-radius: 50px;
-      display: flex; align-items: center; gap: 16px;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.5); z-index: 100;
-      animation: slideUp 0.3s ease;
-    }
-    @keyframes slideUp { from { transform: translate(-50%, 100%); } to { transform: translate(-50%, 0); } }
-    .bulk-bar span { color: #E0E0E0; font-size: 14px; }
-    tr.selected { background: #252525 !important; border-left: 3px solid #52B54B; }
+    .btn-sm { padding: 7px 14px; font-size: 12px; border-radius: 8px; }
+    #toast { position: fixed; top: 24px; right: 24px; background: var(--c-surface); backdrop-filter: blur(16px); border: 1px solid var(--c-border); border-left: 3px solid var(--c-primary); color: #fff; padding: 14px 20px; border-radius: var(--radius-sm); display: none; box-shadow: var(--shadow); z-index: 1000; animation: slideIn 0.3s cubic-bezier(0.4,0,0.2,1); }
+    #toast.error { border-left-color: var(--c-danger); }
+    @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+    .loading { opacity: 0.5; pointer-events: none; }
+    input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; accent-color: var(--c-primary); }
+    tr.selected { background: rgba(82,181,75,0.06); }
+    tr.selected td { border-color: var(--c-border); }
     @media (max-width: 768px) {
+      body { padding: 24px 16px; }
+      .container { max-width: 100%; }
+      h1 { font-size: 1.375rem; }
+      .card { padding: 20px; border-radius: 14px; }
+      .actions { flex-direction: column; }
+      .actions button { width: 100%; justify-content: center; }
       thead { display: none; }
-      tr { display: block; background: #202020; border: 1px solid #333; border-radius: 8px; margin-bottom: 12px; padding: 16px 16px 16px 48px; position: relative; }
-      tr.selected { border-color: #52B54B; background: #252525; border-left: 3px solid #52B54B; }
-      td:first-child { display: block; position: absolute; left: 12px; top: 16px; padding: 0; border: none; }
-      td { display: block; padding: 4px 0; border: none; text-align: left; word-break: break-all; }
-      td.col-sub { font-size: 16px; font-weight: bold; color: #fff; margin-bottom: 4px; }
-      td.col-upstream { font-size: 13px; color: #A0A0A0; margin-bottom: 12px; }
-      td.col-actions { border-top: 1px solid #333; padding-top: 12px; margin-top: 8px; display: flex; justify-content: flex-end; }
-      .btn-sm { min-height: 44px; padding: 12px 16px; }
-      .container { padding: 10px; }
-      .bulk-bar { bottom: 10px; left: 10px; right: 10px; transform: none; border-radius: 8px; }
+      tbody tr { display: block; background: rgba(0,0,0,0.25); border: 1px solid var(--c-border-subtle); border-radius: 14px; margin-bottom: 12px; padding: 16px 16px 16px 48px; position: relative; }
+      tr.selected { border-color: var(--c-primary); background: rgba(82,181,75,0.06); }
+      td:first-child { position: absolute; left: 16px; top: 18px; padding: 0; border: none; }
+      td { display: block; padding: 3px 0; border: none; word-break: break-all; }
+      td.col-sub { font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 2px; }
+      td.col-upstream { font-size: 12px; color: var(--c-muted); margin-bottom: 14px; font-family: ui-monospace, monospace; }
+      td.col-actions { border-top: 1px solid var(--c-border-subtle); padding-top: 14px; margin-top: 8px; display: flex; justify-content: flex-end; }
+      .btn-sm { min-height: 44px; padding: 12px 18px; }
     }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; } }
   </style>
 </head>
 <body>
@@ -90,7 +114,13 @@ export const MANAGE_UI_HTML = `<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>已配置的路由</h2>
+      <div class="card-header">
+        <h2>已配置的路由</h2>
+        <div id="bulkActions" class="bulk-actions" style="display:none;">
+          <span id="selectedCount">已选择 0 项</span>
+          <button onclick="batchDelete()" class="btn-sm danger">删除选中</button>
+        </div>
+      </div>
       <table id="routesTable">
         <thead>
           <tr>
@@ -105,11 +135,6 @@ export const MANAGE_UI_HTML = `<!DOCTYPE html>
         </tbody>
       </table>
     </div>
-  </div>
-
-  <div id="bulkActionBar" class="bulk-bar" style="display:none;">
-    <span id="selectedCount">已选择 0 项</span>
-    <button onclick="batchDelete()" class="danger">删除选中</button>
   </div>
 
   <div id="toast" role="alert" aria-live="polite" aria-atomic="true"></div>
@@ -214,15 +239,15 @@ export const MANAGE_UI_HTML = `<!DOCTYPE html>
       const checks = document.querySelectorAll('.route-check'); selectedRoutes.clear();
       checks.forEach(c => { if (c.checked) selectedRoutes.add(c.value); const tr = c.closest('tr'); if (c.checked) tr.classList.add('selected'); else tr.classList.remove('selected'); });
       const master = document.getElementById('selectAll'); master.checked = checks.length > 0 && selectedRoutes.size === checks.length; master.indeterminate = selectedRoutes.size > 0 && selectedRoutes.size < checks.length;
-      const bar = document.getElementById('bulkActionBar'); const countSpan = document.getElementById('selectedCount');
-      if (selectedRoutes.size > 0) { bar.style.display = 'flex'; countSpan.textContent = \`已选择 \${selectedRoutes.size} 项\`; } else { bar.style.display = 'none'; }
+      const bulk = document.getElementById('bulkActions'); const countSpan = document.getElementById('selectedCount');
+      if (selectedRoutes.size > 0) { bulk.style.display = 'flex'; countSpan.textContent = \`已选择 \${selectedRoutes.size} 项\`; } else { bulk.style.display = 'none'; }
     }
     async function batchDelete() {
       const targets = Array.from(selectedRoutes); if (targets.length === 0) return; if (!confirm(\`确定要删除选中的 \${targets.length} 个路由吗？\`)) return;
       try {
         const headers = { 'Content-Type': 'application/json' }; if (currentVersion) headers['If-Match'] = currentVersion;
         const result = await apiCall('/manage/api/batch-delete', { method: 'POST', headers, body: JSON.stringify({ subdomains: targets }) });
-        showToast(\`成功删除 \${result.count} 个路由 (约60秒生效)\`); selectedRoutes.clear(); document.getElementById('bulkActionBar').style.display = 'none'; await loadRoutes();
+        showToast(\`成功删除 \${result.count} 个路由 (约60秒生效)\`); selectedRoutes.clear(); document.getElementById('bulkActions').style.display = 'none'; await loadRoutes();
       } catch (e) { showToast('批量删除失败：' + e.message, true); }
     }
     async function deleteRoute(sub) { if (!confirm(\`确定要删除路由 "\${sub}" 吗？\`)) return; try { const headers = {}; if (currentVersion) headers['If-Match'] = currentVersion; await apiCall(\`/manage/api/mappings/\${encodeURIComponent(sub)}\`, { method: 'DELETE', headers }); showToast('路由删除成功 (约60秒生效)'); await loadRoutes(); } catch (e) { showToast('删除路由失败：' + e.message, true); } }

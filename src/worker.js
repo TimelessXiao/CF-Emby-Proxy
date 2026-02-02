@@ -116,6 +116,10 @@ let pendingRouteRefreshAt = 0
 // ====================
 const app = new Hono()
 
+app.get('/favicon.ico', (c) => {
+  return c.body(null, 204)
+})
+
 app.get('/manage', (c) => {
   return c.html(MANAGE_UI_HTML)
 })
