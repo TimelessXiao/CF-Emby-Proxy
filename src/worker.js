@@ -515,6 +515,7 @@ app.all('*', async (c) => {
   let retryCount = 0
   let subreqCount = 0
   let streamMode = null
+  let bypassReason = null
   let cacheHit = 0
 
   try {
@@ -585,6 +586,7 @@ app.all('*', async (c) => {
         mediaBody = mediaResult.body
         retryCount = mediaResult.retryAttempt
         streamMode = mediaResult.mode
+        bypassReason = mediaResult.bypassReason || null
         upstreamMs += Date.now() - t0
       } else if (isWebSocket || (req.method === 'POST' && !(isPlaybackInfo && !hasRange))) {
         const t0 = Date.now()
@@ -625,6 +627,9 @@ app.all('*', async (c) => {
     const wantDebug = DEBUG || req.headers.get('x-proxy-debug') === '1'
     if (wantDebug && streamMode) {
       resHeaders.set('X-Proxy-Stream-Mode', streamMode)
+      if (streamMode === 'bypass' && bypassReason) {
+        resHeaders.set('X-Proxy-Bypass-Reason', bypassReason)
+      }
       resHeaders.set('X-Proxy-Retry', String(retryCount))
       resHeaders.set('X-Proxy-Upstream-Status', String(response.status))
     }
@@ -1231,11 +1236,22 @@ async function fetchWithTimeout(url, options, timeout) {
 async function fetchWithTtfbTimeout(url, options, ttfbMs, externalController = null) {
   const controller = externalController || new AbortController()
   const unlink = linkSignal(controller, options?.signal)
-  const timer = setTimeout(() => controller.abort(), ttfbMs)
+  const timeoutReason = 'TTFB timeout'
+  const timer = setTimeout(() => {
+    try { controller.abort(timeoutReason) } catch { controller.abort() }
+  }, ttfbMs)
 
   try {
     const response = await fetch(url, { ...options, signal: controller.signal })
     return response
+  } catch (error) {
+    // P2: 标记 TTFB 超时错误，便于重试策略区分
+    if (controller.signal.aborted && controller.signal.reason === timeoutReason) {
+      const ttfbError = new Error(timeoutReason)
+      ttfbError.name = 'TTFBTimeoutError'
+      throw ttfbError
+    }
+    throw error
   } finally {
     clearTimeout(timer)
     unlink()
@@ -1304,11 +1320,21 @@ function createUpstreamAbortController(clientSignal) {
 }
 
 // 判定是否跳过 JS 包装，走原生流直通
+// 返回 { bypass: boolean, reason: string|null }
 function shouldBypassWrap(resp, options = {}, cfg = {}, url = '') {
   const status = resp.status || 0
   const ctype = (resp.headers.get('content-type') || '').toLowerCase().split(';')[0].trim()
   const rangeReq = options.headers?.get?.('Range') || options.headers?.get?.('range')
   const isRange = status === 206 || !!rangeReq
+
+  // P0: VIDEO_REGEX 路径检测（/Videos/, /Items/.../Stream, /Items/.../Download）
+  const urlStr = typeof url === 'string' ? url : (url?.toString?.() || '')
+  const isVideoPath = CONFIG.VIDEO_REGEX.test(urlStr)
+
+  // P0: Content-Length 阈值检测
+  const contentLength = parseInt(resp.headers.get('content-length') || '0', 10) || 0
+  const wrapBypassBytes = cfg.wrapBypassBytes || CONFIG.MEDIA_WRAP_BYPASS_BYTES
+  const overBypassBytes = contentLength > 0 && contentLength >= wrapBypassBytes
 
   // 媒体 MIME 类型检测（含 HLS/DASH/MPEG-TS）
   const isMediaMime = ctype.startsWith('video/') ||
@@ -1318,15 +1344,26 @@ function shouldBypassWrap(resp, options = {}, cfg = {}, url = '') {
                       ctype === 'video/mp2t' ||
                       ctype === 'application/dash+xml'
 
-  // octet-stream 需辅助信号判定
+  // octet-stream 或空 content-type 需辅助信号判定
+  const isOctetOrUnknown = ctype === 'application/octet-stream' || ctype === ''
+  let isExtMedia = false
   let isOctetMedia = false
-  if (ctype === 'application/octet-stream') {
-    // 支持带查询参数的 URL（如 ?static=true）
+  if (isOctetOrUnknown) {
     const mediaExt = /\.(mp4|mkv|ts|m3u8|mpd|mov|avi|flv|webm|mp3|aac|flac|wav|m4a|ogg|opus|m4s|cmf|ismv)($|\?)/i
-    isOctetMedia = isRange || mediaExt.test(url)
+    isExtMedia = mediaExt.test(urlStr)
+    isOctetMedia = isRange || isExtMedia || isVideoPath || overBypassBytes
   }
 
-  return isRange || isMediaMime || isOctetMedia
+  const bypass = isRange || isMediaMime || isVideoPath || overBypassBytes || isOctetMedia
+  let reason = null
+  if (bypass) {
+    if (isRange) reason = 'Range'
+    else if (isVideoPath) reason = 'VIDEO_REGEX'
+    else if (isMediaMime || isExtMedia) reason = 'MIME'
+    else if (overBypassBytes) reason = 'Length'
+  }
+
+  return { bypass, reason }
 }
 
 // 首块探测：仅读取第一块数据验证上游活性
@@ -1390,30 +1427,35 @@ async function fetchMediaWithRetries(url, options, cfg, clientSignal) {
       }
 
       // 媒体直通：headers 到达后立即返回，不阻塞首块探测
-      if (shouldBypassWrap(resp, options, cfg, url) && resp.body) {
-        return { response: resp, body: resp.body, retryAttempt: attempt, mode: 'bypass' }
+      const bypassInfo = shouldBypassWrap(resp, options, cfg, url)
+      if (bypassInfo.bypass && resp.body) {
+        return { response: resp, body: resp.body, retryAttempt: attempt, mode: 'bypass', bypassReason: bypassInfo.reason }
       }
 
       // 非媒体流走包装器（保留 idle watchdog）
       const wrapped = wrapMediaResponseBody(resp, upstreamController, clientSignal, cfg, cleanup)
-      return { response: resp, body: wrapped.stream, retryAttempt: attempt, mode: 'wrap' }
+      return { response: resp, body: wrapped.stream, retryAttempt: attempt, mode: 'wrap', bypassReason: null }
     } catch (error) {
       lastError = error
       const method = (options.method || 'GET').toUpperCase()
       const isIdempotent = method === 'GET' || method === 'HEAD'
-      const retryable = isIdempotent && attempt < cfg.retryMax && (
-        error.name === 'AbortError' ||
-        error.message === 'Timeout' ||
-        /timeout/i.test(error?.message || '') ||
-        error.code === 23 ||
-        (error.message && error.message.startsWith('First body timeout')) ||
-        (error.message && error.message.startsWith('Idle timeout'))
-      )
+      const isClientAbort = clientSignal?.aborted
+
+      // P2: 区分错误类型
+      const isTtfbTimeout = error?.name === 'TTFBTimeoutError' || /TTFB timeout/i.test(error?.message || '')
+      const isNetworkError = error?.name === 'TypeError' || /NetworkError/i.test(error?.message || '') || error?.code === 23
 
       cleanup()
 
-      if (retryable) {
-        await sleep(mediaRetryBackoffMs(attempt))
+      // P2: TTFB 超时不重试，直接抛出（避免叠加等待）
+      if (isTtfbTimeout) {
+        throw error
+      }
+
+      // P2: 网络错误允许 1 次快速重试（250ms backoff），但需尊重 cfg.retryMax
+      const canRetryNetwork = isIdempotent && !isClientAbort && isNetworkError && attempt < Math.min(cfg.retryMax, 1)
+      if (canRetryNetwork) {
+        await sleep(250)
         continue
       }
 
@@ -1422,20 +1464,18 @@ async function fetchMediaWithRetries(url, options, cfg, clientSignal) {
   }
 
   if (lastResponse) {
-    return { response: lastResponse, body: lastResponse.body, retryAttempt: cfg.retryMax, mode: 'fallback' }
+    return { response: lastResponse, body: lastResponse.body, retryAttempt: cfg.retryMax, mode: 'fallback', bypassReason: null }
   }
 
   throw lastError || new Error('Media fetch failed')
 }
 
-// 媒体响应体包装器（首块超时 + 空闲监控 + 进度阈值 + 客户端取消传播）
+// 媒体响应体包装器（首块超时 + pull-aware 空闲监控 + 客户端取消传播）
 function wrapMediaResponseBody(upstreamResp, upstreamController, clientSignal, cfg = {}, abortCleanup = () => {}) {
   const reader = upstreamResp.body?.getReader?.()
   const firstBodyTimeoutMs = cfg.firstBodyTimeoutMs || CONFIG.MEDIA_FIRST_BODY_TIMEOUT_MS
   const idleTimeoutMs = cfg.idleTimeoutMs || CONFIG.MEDIA_IDLE_TIMEOUT_MS
-  const progressThreshold = cfg.progressThresholdBytes || CONFIG.MEDIA_PROGRESS_THRESHOLD_BYTES
 
-  let bytesSinceReset = 0
   let cancelled = false
   let settledFirst = false
   let idleTimer = null
@@ -1450,9 +1490,14 @@ function wrapMediaResponseBody(upstreamResp, upstreamController, clientSignal, c
   // 防止 unhandled rejection（promise 未被外部消费时）
   firstChunkPromise.catch(() => {})
 
+  // P1: 分离 idle timer 停止逻辑
+  const stopIdleTimer = () => {
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null }
+  }
+
   const clearTimers = () => {
     if (firstTimer) { clearTimeout(firstTimer); firstTimer = null }
-    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null }
+    stopIdleTimer()
   }
 
   const cleanup = () => {
@@ -1512,6 +1557,8 @@ function wrapMediaResponseBody(upstreamResp, upstreamController, clientSignal, c
       }
 
       try {
+        // P1: 仅在首块已收到后，pull 期间启动 idle timer
+        if (settledFirst) startIdleTimer()
         const { done, value } = await reader.read()
         if (cancelled) return
 
@@ -1527,24 +1574,17 @@ function wrapMediaResponseBody(upstreamResp, upstreamController, clientSignal, c
           settledFirst = true
           resolveFirst?.()
           if (firstTimer) { clearTimeout(firstTimer); firstTimer = null }
-          startIdleTimer()
         }
 
-        const chunkSize = value?.byteLength || 0
-        bytesSinceReset += chunkSize
         controller.enqueue(value)
-
-        if (bytesSinceReset >= progressThreshold) {
-          bytesSinceReset = 0
-          startIdleTimer()
-        } else if (!idleTimer) {
-          startIdleTimer()
-        }
       } catch (error) {
         if (cancelled) return
         if (!settledFirst) { settledFirst = true; rejectFirst?.(error) }
         cancel(error)
         try { controller.error(error) } catch {}
+      } finally {
+        // P1: pull 结束时立即停止 idle timer（无论成功/失败/done）
+        stopIdleTimer()
       }
     },
     cancel(reason) {
