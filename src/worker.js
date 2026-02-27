@@ -31,8 +31,15 @@ const CONFIG = {
   ENABLE_HOP_BY_HOP_KEEPALIVE: false,
 
   // 播放清单与播放信息微缓存
-  M3U8_REGEX: /\.m3u8($|\?)/i,
+  M3U8_REGEX: /\.m3u8$/i,
+  MPD_REGEX: /\.mpd$/i,
   PLAYBACKINFO_REGEX: /\/PlaybackInfo/i,
+
+  // 直链媒体扩展名识别（基础集，不含清单）
+  MEDIA_EXT_REGEX: /\.(mp4|mkv|ts|mov|avi|flv|webm|mp3|aac|flac|wav|m4a|ogg|opus|m4s|wmv|rmvb|rm|3gp|asf|vob|divx|cmf|ismv)$/i,
+  // 字幕/元数据文件排除
+  SUBTITLE_REGEX: /\.(vtt|srt|ass|ssa|sub|idx|ttml|dfxp|smi|lrc)$/i,
+  RANGE_ZERO_REGEX: /^\s*bytes\s*=\s*0\s*-\s*$/i,
   M3U8_TTL: 2,
   PLAYBACKINFO_TTL: 3,
 
@@ -101,8 +108,8 @@ const CACHE_QUERY_ALLOWLIST = new Set([
 const TAG_HEX_REGEX = /^[a-f0-9]{8,128}$/i
 const TAG_BASE64URL_REGEX = /^[A-Za-z0-9_-]{8,128}$/
 
-// 扩展媒体后缀正则（模块常量，避免热路径重复创建）
-const EXT_MEDIA_REGEX = /\.(mp4|mkv|ts|m3u8|mpd|mov|avi|flv|webm|mp3|aac|flac|wav|m4a|ogg|opus|m4s|cmf|ismv|wmv|rmvb|rm|3gp|asf|vob|divx)($|\?)/i
+// 扩展媒体后缀正则（含清单文件，用于 bypass 判定；与 CONFIG.MEDIA_EXT_REGEX 保持同步）
+const EXT_MEDIA_REGEX = /\.(mp4|mkv|ts|m3u8|mpd|mov|avi|flv|webm|mp3|aac|flac|wav|m4a|ogg|opus|m4s|cmf|ismv|wmv|rmvb|rm|3gp|asf|vob|divx)$/i
 
 
 const ROUTE_POINTER_KEY = 'routes:current'
@@ -424,6 +431,12 @@ app.all('*', async (c) => {
   const isM3U8 = CONFIG.M3U8_REGEX.test(effectivePathname)
   const isPlaybackInfo = CONFIG.PLAYBACKINFO_REGEX.test(effectivePathname)
   const hasRange = !!req.headers.get('range')
+  // 直链媒体扩展名识别（排除清单文件）
+  const isExtMedia = CONFIG.MEDIA_EXT_REGEX.test(effectivePathname)
+  const isMPD = CONFIG.MPD_REGEX.test(effectivePathname)
+  const isSubtitle = CONFIG.SUBTITLE_REGEX.test(effectivePathname)
+  const isManifestLike = isM3U8 || isMPD
+  const isMediaLike = (isVideo || isExtMedia) && !isManifestLike && !isSubtitle
   const ua = req.headers.get('user-agent') || ''
   const playerHint = getPlayerHint(ua)
 
@@ -440,7 +453,7 @@ app.all('*', async (c) => {
   }
 
   //  媒体/Range 请求强制 identity 编码，避免 gzip 压缩导致的中间层异常
-  if (isVideo || hasRange) {
+  if (isMediaLike || hasRange) {
     proxyHeaders.set('Accept-Encoding', 'identity')
   }
 
@@ -556,12 +569,13 @@ app.all('*', async (c) => {
     DEBUG_LOG_REDACT: LOG_REDACT
   }) : null
   let detailedLogged = false
-  const kind = isVideo ? 'media' : (hasRange ? 'range' : (isM3U8 ? 'm3u8' : (isPlaybackInfo ? 'playbackinfo' : 'api')))
+  const kind = isMediaLike ? 'media' : (hasRange ? 'range' : (isM3U8 ? 'm3u8' : (isPlaybackInfo ? 'playbackinfo' : 'api')))
   let kvReadMs = routeKvMs || 0
   let upstreamMs = 0
   let retryCount = 0
   let subreqCount = 0
   let streamMode = null
+  let selectedTimeoutMs = null
   let bypassReason = null
   let cacheHit = 0
 
@@ -597,6 +611,7 @@ app.all('*', async (c) => {
 
       const t0 = Date.now()
       subreqCount++
+      selectedTimeoutMs = CONFIG.CRITICAL_TIMEOUT
       const upstreamResp = await fetchWithTimeout(targetUrl.toString(), fetchOptions, CONFIG.CRITICAL_TIMEOUT)
       upstreamMs += Date.now() - t0
 
@@ -614,7 +629,8 @@ app.all('*', async (c) => {
     }
 
     if (!response) {
-      if ((isVideo || hasRange) && !isWebSocket) {
+      if ((isMediaLike || hasRange) && !isWebSocket) {
+        selectedTimeoutMs = CONFIG.MEDIA_TTFB_TIMEOUT_MS
         const t0 = Date.now()
         subreqCount++
         const mediaResult = await fetchMediaWithRetries(
@@ -637,15 +653,18 @@ app.all('*', async (c) => {
         bypassReason = mediaResult.bypassReason || null
         upstreamMs += Date.now() - t0
       } else if (isWebSocket || (req.method === 'POST' && !(isPlaybackInfo && !hasRange))) {
+        // WebSocket/POST 无超时包装，标记为 null 表示未使用超时
+        selectedTimeoutMs = null
         const t0 = Date.now()
         subreqCount++
         response = await fetch(targetUrl.toString(), fetchOptions)
         upstreamMs += Date.now() - t0
       } else {
-        // Critical Path 逻辑更新：API Cacheable 的请求均视为关键路径
-        const isCriticalPath = (isM3U8 && req.method === 'GET') || (isApiCacheable && req.method === 'GET') || (isPlaybackInfo && req.method === 'POST')
+        // Critical Path 逻辑更新：API Cacheable 的请求均视为关键路径，MPD 与 M3U8 同等处理
+        const isCriticalPath = (isManifestLike && req.method === 'GET') || (isApiCacheable && req.method === 'GET') || (isPlaybackInfo && req.method === 'POST')
 
         if (isCriticalPath) {
+          selectedTimeoutMs = CONFIG.CRITICAL_TIMEOUT
           const t0 = Date.now()
           subreqCount++
           response = await fetchWithTimeout(targetUrl.toString(), fetchOptions, CONFIG.CRITICAL_TIMEOUT)
@@ -653,6 +672,7 @@ app.all('*', async (c) => {
         } else {
           // 图片请求使用 CRITICAL_TIMEOUT，其他 API 使用 API_TIMEOUT
           const timeout = isImage ? CONFIG.CRITICAL_TIMEOUT : CONFIG.API_TIMEOUT
+          selectedTimeoutMs = timeout
           const t0 = Date.now()
           subreqCount++
           response = await fetchWithTimeout(targetUrl.toString(), fetchOptions, timeout)
@@ -665,6 +685,26 @@ app.all('*', async (c) => {
 
     if (response.status !== 101) {
       cleanupHopByHopHeaders(resHeaders, false, false)
+    }
+
+    // Range+200 → 206 转换：仅对媒体 GET/HEAD 请求的 bytes=0- 场景，且源站声明支持 Range
+    // 排除 If-Range 请求：若上游因条件不满足而返回 200，不应改写为 206
+    const rangeHeader = req.headers.get('range') || ''
+    const hasIfRange = req.headers.has('if-range')
+    const originAcceptRanges = (resHeaders.get('accept-ranges') || '').toLowerCase()
+    const isRangeCapable = originAcceptRanges === 'bytes'
+    const isGetOrHead = req.method === 'GET' || req.method === 'HEAD'
+    if (isMediaLike && hasRange && !hasIfRange && isGetOrHead && CONFIG.RANGE_ZERO_REGEX.test(rangeHeader.trim()) && response.status === 200 && isRangeCapable) {
+      const clStr = (resHeaders.get('content-length') || '').trim()
+      const cl = /^\d+$/.test(clStr) ? Number(clStr) : 0
+      // 安全边界：仅对 Number.MAX_SAFE_INTEGER 内的值进行转换，避免精度丢失
+      if (cl > 0 && Number.isSafeInteger(cl)) {
+        resHeaders.set('Content-Range', `bytes 0-${cl - 1}/${cl}`)
+        const existingVary = resHeaders.get('Vary') || ''
+        const hasRangeVary = existingVary.toLowerCase().includes('range')
+        resHeaders.set('Vary', hasRangeVary ? existingVary : (existingVary ? `${existingVary}, Range` : 'Range'))
+        response = new Response(response.body, { status: 206, statusText: 'Partial Content', headers: resHeaders })
+      }
     }
 
     resHeaders.delete('content-security-policy')
@@ -834,7 +874,7 @@ app.all('*', async (c) => {
 
   } catch (error) {
     //  错误语义化：区分 Timeout (504) 与 Bad Gateway (502)
-    const isTimeout = error.name === 'AbortError' || error.message === 'Timeout' || (error.code === 23);
+    const isTimeout = error.name === 'AbortError' || error.name === 'TTFBTimeoutError' || /timeout/i.test(error.message) || (error.code === 23);
     const status = isTimeout ? 504 : 502
     const statusText = isTimeout ? 'Gateway Timeout' : 'Bad Gateway'
 
@@ -863,11 +903,14 @@ app.all('*', async (c) => {
       return new Response(null, { status, headers: imgErrorHeaders })
     }
 
-    //  诊断 Header：对于视频/Range 使用正确的 TTFB 超时值
+    //  诊断 Header：使用实际触发分支的超时值
     const errorHeaders = new Headers({ 'Content-Type': 'application/json' })
     if (DEBUG) {
-      const timeoutMs = (isVideo || hasRange) ? CONFIG.MEDIA_TTFB_TIMEOUT_MS : CONFIG.CRITICAL_TIMEOUT
-      errorHeaders.set('X-Proxy-Error', isTimeout ? `Timeout-${timeoutMs}ms` : `Upstream-${error.message}`)
+      if (isTimeout && selectedTimeoutMs !== null) {
+        errorHeaders.set('X-Proxy-Error', `Timeout-${selectedTimeoutMs}ms`)
+      } else {
+        errorHeaders.set('X-Proxy-Error', `Upstream-${error.message}`)
+      }
     }
 
     // 通用异常详细日志
@@ -1413,8 +1456,10 @@ function shouldBypassWrap(resp, options = {}, cfg = {}, url = '', playerHint = n
                       ctype === 'video/mp2t' ||
                       ctype === 'application/dash+xml'
 
-  // 扩展媒体后缀检测（使用模块常量）
-  const isExtMedia = EXT_MEDIA_REGEX.test(urlStr)
+  // 扩展媒体后缀检测（提取 pathname 避免查询参数干扰）
+  let urlPathname = ''
+  try { urlPathname = new URL(urlStr).pathname } catch { urlPathname = urlStr.split('?')[0] }
+  const isExtMedia = EXT_MEDIA_REGEX.test(urlPathname)
 
   // octet-stream 或空 content-type 需辅助信号判定
   const isOctetOrUnknown = ctype === 'application/octet-stream' || ctype === ''
