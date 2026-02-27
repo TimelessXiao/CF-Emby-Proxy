@@ -56,7 +56,7 @@ const CONFIG = {
   MEDIA_RETRY_BACKOFF_FIRST_MAX_MS: 400,
   MEDIA_RETRY_BACKOFF_SECOND_MIN_MS: 400,  // 第2次重试抖动窗口
   MEDIA_RETRY_BACKOFF_SECOND_MAX_MS: 800,
-  MEDIA_WRAP_BYPASS_BYTES: 512000,         // 500KB 阈值，超过则走原生流直通
+  MEDIA_WRAP_BYPASS_BYTES: 262144,         // 256KB 阈值，超过则走原生流直通（降低以提升 bypass 命中率）
 
   // 空 tag 图片短 TTL 缓存配置
   EMPTY_TAG_IMAGE_TTL_S: 90,          // 空 tag 匿名图片边缘缓存 TTL（秒）
@@ -100,6 +100,9 @@ const CACHE_QUERY_ALLOWLIST = new Set([
 // Tag 参数校验正则（用于匿名图片缓存）
 const TAG_HEX_REGEX = /^[a-f0-9]{8,128}$/i
 const TAG_BASE64URL_REGEX = /^[A-Za-z0-9_-]{8,128}$/
+
+// 扩展媒体后缀正则（模块常量，避免热路径重复创建）
+const EXT_MEDIA_REGEX = /\.(mp4|mkv|ts|m3u8|mpd|mov|avi|flv|webm|mp3|aac|flac|wav|m4a|ogg|opus|m4s|cmf|ismv|wmv|rmvb|rm|3gp|asf|vob|divx)($|\?)/i
 
 
 const ROUTE_POINTER_KEY = 'routes:current'
@@ -301,30 +304,74 @@ app.all('*', async (c) => {
   const req = c.req.raw
   const url = new URL(req.url)
 
+  // OPTIONS 预检请求快速响应（CORS 支持）
+  if (req.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, HEAD',
+        'Access-Control-Allow-Headers': '*',
+        'Access-Control-Max-Age': '86400'
+      }
+    })
+  }
+
   // 跳过管理路由，确保 /manage 在所有域名下都能访问
   if (url.pathname.startsWith('/manage')) {
     return c.notFound()
   }
 
-  // 动态路由：根据子域选择上游
-  const { version: routeVer, mappings, kvReadMs: routeKvMs } = await loadRouteMappings(c.env, c.executionCtx)
-  const subdomain = subdomainOf(url.hostname)
-  const chosenMapping = mappings[subdomain] || mappings['default'] || null
-  const upstreamBase = mappingToBase(chosenMapping) || c.env.UPSTREAM_URL || CONFIG.UPSTREAM_URL
+  // 前后端分离：入站解包代理路径
+  const unwrappedUrl = unwrapProxyPath(url.pathname)
+  const isProxyMode = !!unwrappedUrl
+  let targetUrl, effectivePathname
+  let routeKvMs = 0
+  let subdomain = ''
 
-  // 强制使用 HTTPS 协议回源
-  const targetUrl = new URL(url.pathname + url.search, upstreamBase)
+  if (isProxyMode) {
+    // 代理路径模式：/https://cdn.example.com/video.mkv?sign=xxx
+    // 拼接原始请求的 query 参数（保留签名等）
+    const fullTargetUrl = unwrappedUrl + url.search
+    const validation = isValidProxyTarget(fullTargetUrl)
+    if (!validation.valid) {
+      return new Response(JSON.stringify({ error: `Blocked: ${validation.reason}` }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json', 'X-Proxy-Error': validation.reason }
+      })
+    }
+    targetUrl = new URL(fullTargetUrl)
+    effectivePathname = targetUrl.pathname
+  } else {
+    // 常规模式：根据子域选择上游
+    const routeData = await loadRouteMappings(c.env, c.executionCtx)
+    routeKvMs = routeData.kvReadMs || 0
+    subdomain = subdomainOf(url.hostname)
+    const chosenMapping = routeData.mappings[subdomain] || routeData.mappings['default'] || null
+    const upstreamBase = mappingToBase(chosenMapping) || c.env.UPSTREAM_URL || CONFIG.UPSTREAM_URL
+    targetUrl = new URL(url.pathname + url.search, upstreamBase)
+    effectivePathname = url.pathname
+  }
   
   const proxyHeaders = new Headers(req.headers)
   proxyHeaders.set('Host', targetUrl.hostname)
   proxyHeaders.set('Referer', targetUrl.origin)
   proxyHeaders.set('Origin', targetUrl.origin)
-  
+
   // 剔除杂项头
   proxyHeaders.delete('cf-connecting-ip')
   proxyHeaders.delete('x-forwarded-for')
   proxyHeaders.delete('cf-ray')
   proxyHeaders.delete('cf-visitor')
+
+  // 代理模式：剥离敏感头（防止凭证泄露到第三方）
+  if (isProxyMode) {
+    proxyHeaders.delete('authorization')
+    proxyHeaders.delete('cookie')
+    proxyHeaders.delete('x-emby-token')
+    proxyHeaders.delete('x-mediabrowser-token')
+    proxyHeaders.delete('x-emby-authorization')
+  }
 
   // 仅缓冲关键非流式交互
   let reqBody = req.body
@@ -362,30 +409,30 @@ app.all('*', async (c) => {
     }
   }
 
-  // 判别请求类型
-  const isStaticAsset = CONFIG.STATIC_REGEX.test(url.pathname)
-  const isItemImage = CONFIG.ITEM_IMAGE_REGEX.test(url.pathname)
+  // 判别请求类型（使用 effectivePathname 支持代理路径）
+  const isStaticAsset = CONFIG.STATIC_REGEX.test(effectivePathname)
+  const isItemImage = CONFIG.ITEM_IMAGE_REGEX.test(effectivePathname)
   // 限制可缓存图片：Items 图片路径 或 legacy /Images/{type} 路径
-  const isLegacyImage = /^\/Images\/(Primary|Backdrop|Logo|Thumb|Banner|Art|Still|Box|Screenshot|Chapter|Menu|Disc|Poster)/i.test(url.pathname)
+  const isLegacyImage = /^\/Images\/(Primary|Backdrop|Logo|Thumb|Banner|Art|Still|Box|Screenshot|Chapter|Menu|Disc|Poster)/i.test(effectivePathname)
   const isImage = isItemImage || isLegacyImage
   const isStatic = isStaticAsset || isImage
-  const isVideo = CONFIG.VIDEO_REGEX.test(url.pathname)
+  const isVideo = CONFIG.VIDEO_REGEX.test(effectivePathname)
   const isApiCacheable = req.method === 'GET' &&
-                         CONFIG.API_CACHE_REGEX.test(url.pathname) &&
+                         CONFIG.API_CACHE_REGEX.test(effectivePathname) &&
                          !CONFIG.API_CACHE_BYPASS_REGEX.test(url.search)
   const isWebSocket = (req.headers.get('Upgrade') || '').toLowerCase() === 'websocket'
-  const isM3U8 = CONFIG.M3U8_REGEX.test(url.pathname)
-  const isPlaybackInfo = CONFIG.PLAYBACKINFO_REGEX.test(url.pathname)
+  const isM3U8 = CONFIG.M3U8_REGEX.test(effectivePathname)
+  const isPlaybackInfo = CONFIG.PLAYBACKINFO_REGEX.test(effectivePathname)
   const hasRange = !!req.headers.get('range')
   const ua = req.headers.get('user-agent') || ''
   const playerHint = getPlayerHint(ua)
 
   // 匿名图片缓存：仅对带有效 tag 参数的 Items 图片路径启用（大小写不敏感）
-  const tagParam = url.searchParams.get('tag') || ''
+  const tagParam = url.searchParams.get('tag') || targetUrl.searchParams.get('tag') || ''
   const tag = tagParam.trim()
   const hasValidTag = !!tag && (TAG_HEX_REGEX.test(tag) || TAG_BASE64URL_REGEX.test(tag))
-  const isTaggedArtwork = /\/Items\/[^\/]+\/Images\/[^\/]+/i.test(url.pathname) &&
-                          !/\/(Users|Persons)\//i.test(url.pathname) &&
+  const isTaggedArtwork = /\/Items\/[^\/]+\/Images\/[^\/]+/i.test(effectivePathname) &&
+                          !/\/(Users|Persons)\//i.test(effectivePathname) &&
                           hasValidTag
 
   if (!isWebSocket) {
@@ -580,7 +627,8 @@ app.all('*', async (c) => {
             idleTimeoutMs: CONFIG.MEDIA_IDLE_TIMEOUT_MS,
             progressThresholdBytes: CONFIG.MEDIA_PROGRESS_THRESHOLD_BYTES
           },
-          req.signal
+          req.signal,
+          playerHint
         )
         response = mediaResult.response
         mediaBody = mediaResult.body
@@ -703,10 +751,31 @@ app.all('*', async (c) => {
         const location = resHeaders.get('location')
         if (location) {
              const locUrl = new URL(location, targetUrl.href)
-             if (locUrl.hostname === targetUrl.hostname) {
+             // 跨域重定向校验
+             const validation = isValidProxyTarget(locUrl.href)
+             if (!validation.valid) {
+                 return new Response(JSON.stringify({ error: 'Blocked redirect target' }), {
+                     status: 502,
+                     headers: {
+                         'Content-Type': 'application/json',
+                         'X-Proxy-Error': `Blocked-Redirect-${validation.reason}`,
+                         'Access-Control-Allow-Origin': '*'
+                     }
+                 })
+             }
+
+             if (isProxyMode) {
+                 // 代理模式：所有重定向都包装为代理路径（避免断链）
+                 resHeaders.set('Location', `/${locUrl.protocol}//${locUrl.host}${locUrl.pathname}${locUrl.search}`)
+             } else if (locUrl.origin === targetUrl.origin) {
+                 // 常规模式同源（协议+主机+端口）：相对化路径
                  resHeaders.set('Location', locUrl.pathname + locUrl.search)
+             } else {
+                 // 常规模式跨域：包装为代理路径
+                 resHeaders.set('Location', `/${locUrl.protocol}//${locUrl.host}${locUrl.pathname}${locUrl.search}`)
              }
         }
+        resHeaders.set('Access-Control-Allow-Origin', '*')
         return new Response(null, { status: response.status, headers: resHeaders })
     }
 
@@ -1321,7 +1390,7 @@ function createUpstreamAbortController(clientSignal) {
 
 // 判定是否跳过 JS 包装，走原生流直通
 // 返回 { bypass: boolean, reason: string|null }
-function shouldBypassWrap(resp, options = {}, cfg = {}, url = '') {
+function shouldBypassWrap(resp, options = {}, cfg = {}, url = '', playerHint = null) {
   const status = resp.status || 0
   const ctype = (resp.headers.get('content-type') || '').toLowerCase().split(';')[0].trim()
   const rangeReq = options.headers?.get?.('Range') || options.headers?.get?.('range')
@@ -1331,7 +1400,7 @@ function shouldBypassWrap(resp, options = {}, cfg = {}, url = '') {
   const urlStr = typeof url === 'string' ? url : (url?.toString?.() || '')
   const isVideoPath = CONFIG.VIDEO_REGEX.test(urlStr)
 
-  // P0: Content-Length 阈值检测
+  // P0: Content-Length 阈值检测（降低阈值提升 bypass 命中率）
   const contentLength = parseInt(resp.headers.get('content-length') || '0', 10) || 0
   const wrapBypassBytes = cfg.wrapBypassBytes || CONFIG.MEDIA_WRAP_BYPASS_BYTES
   const overBypassBytes = contentLength > 0 && contentLength >= wrapBypassBytes
@@ -1344,23 +1413,26 @@ function shouldBypassWrap(resp, options = {}, cfg = {}, url = '') {
                       ctype === 'video/mp2t' ||
                       ctype === 'application/dash+xml'
 
+  // 扩展媒体后缀检测（使用模块常量）
+  const isExtMedia = EXT_MEDIA_REGEX.test(urlStr)
+
   // octet-stream 或空 content-type 需辅助信号判定
   const isOctetOrUnknown = ctype === 'application/octet-stream' || ctype === ''
-  let isExtMedia = false
-  let isOctetMedia = false
-  if (isOctetOrUnknown) {
-    const mediaExt = /\.(mp4|mkv|ts|m3u8|mpd|mov|avi|flv|webm|mp3|aac|flac|wav|m4a|ogg|opus|m4s|cmf|ismv)($|\?)/i
-    isExtMedia = mediaExt.test(urlStr)
-    isOctetMedia = isRange || isExtMedia || isVideoPath || overBypassBytes
-  }
+  const isOctetMedia = isOctetOrUnknown && (isRange || isExtMedia || isVideoPath || overBypassBytes)
 
-  const bypass = isRange || isMediaMime || isVideoPath || overBypassBytes || isOctetMedia
+  // 原生客户端强制 bypass（afusektv/hills/infuse 等）
+  const nativeClientBypass = playerHint && ['afusekt', 'hills', 'infuse', 'exoplayer', 'mpv'].includes(playerHint)
+
+  const bypass = isRange || isMediaMime || isVideoPath || overBypassBytes || isOctetMedia || isExtMedia || nativeClientBypass
   let reason = null
   if (bypass) {
     if (isRange) reason = 'Range'
     else if (isVideoPath) reason = 'VIDEO_REGEX'
-    else if (isMediaMime || isExtMedia) reason = 'MIME'
+    else if (nativeClientBypass) reason = 'NativeClient'
+    else if (isMediaMime) reason = 'MIME'
+    else if (isExtMedia) reason = 'Extension'
     else if (overBypassBytes) reason = 'Length'
+    else if (isOctetMedia) reason = 'OctetStream'
   }
 
   return { bypass, reason }
@@ -1394,7 +1466,7 @@ function mediaRetryBackoffMs(attempt) {
 }
 
 // 媒体请求重试包装器（覆盖 TTFB/首块/5xx/网络错误）
-async function fetchMediaWithRetries(url, options, cfg, clientSignal) {
+async function fetchMediaWithRetries(url, options, cfg, clientSignal, playerHint = null) {
   let lastResponse = null
   let lastError = null
 
@@ -1427,7 +1499,7 @@ async function fetchMediaWithRetries(url, options, cfg, clientSignal) {
       }
 
       // 媒体直通：headers 到达后立即返回，不阻塞首块探测
-      const bypassInfo = shouldBypassWrap(resp, options, cfg, url)
+      const bypassInfo = shouldBypassWrap(resp, options, cfg, url, playerHint)
       if (bypassInfo.bypass && resp.body) {
         return { response: resp, body: resp.body, retryAttempt: attempt, mode: 'bypass', bypassReason: bypassInfo.reason }
       }
@@ -1619,6 +1691,69 @@ function isEmptyTagArtwork(url) {
 // ====================
 // Region 4: 支撑层 (Support)
 // ====================
+
+// 内网 IP 检测（防 SSRF）
+function isPrivateIP(hostname) {
+  if (!hostname) return false
+  const h = hostname.toLowerCase()
+  // IPv4 私网/保留地址
+  const ipv4Private = /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.|255\.255\.255\.255)/
+  // IPv4 格式检测
+  const ipv4Match = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (ipv4Match) {
+    if (ipv4Private.test(h)) return true
+    // 0.0.0.0/8, 100.64.0.0/10 (CGNAT), 198.18.0.0/15 (benchmark)
+    const [, a, b] = ipv4Match.map(Number)
+    if (a === 0 || a === 100 && b >= 64 && b <= 127 || a === 198 && (b === 18 || b === 19)) return true
+    return false
+  }
+  // IPv6 私网/保留地址
+  if (h === '::1' || h === '[::1]') return true
+  const ipv6Clean = h.replace(/^\[|\]$/g, '')
+  if (/^(fc|fd)[0-9a-f]{2}:/i.test(ipv6Clean)) return true  // fc00::/7 ULA
+  if (/^fe[89ab][0-9a-f]:/i.test(ipv6Clean)) return true    // fe80::/10 link-local
+  // IPv4-mapped 点分十进制形式
+  if (/^::ffff:(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(ipv6Clean)) return true
+  // IPv4-mapped 十六进制形式 (::ffff:7f00:1 = 127.0.0.1, ::ffff:a00:0 = 10.0.0.0, etc.)
+  const hexMapped = ipv6Clean.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i)
+  if (hexMapped) {
+    const hi = parseInt(hexMapped[1], 16)
+    const lo = parseInt(hexMapped[2], 16)
+    const a = (hi >> 8) & 0xff, b = hi & 0xff
+    // 检测私网段：127.x, 10.x, 192.168.x, 172.16-31.x, 169.254.x, 0.x
+    if (a === 127 || a === 10 || a === 0) return true
+    if (a === 192 && b === 168) return true
+    if (a === 172 && b >= 16 && b <= 31) return true
+    if (a === 169 && b === 254) return true
+  }
+  // localhost 别名
+  if (h === 'localhost' || h.endsWith('.localhost')) return true
+  return false
+}
+
+// 校验代理目标 URL 合法性
+function isValidProxyTarget(urlStr) {
+  try {
+    const u = new URL(urlStr)
+    // 仅允许 http/https 协议
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return { valid: false, reason: 'protocol' }
+    // 过滤内网 IP
+    if (isPrivateIP(u.hostname)) return { valid: false, reason: 'private-ip' }
+    return { valid: true, reason: null }
+  } catch {
+    return { valid: false, reason: 'invalid-url' }
+  }
+}
+
+// 解包代理路径（入站）
+function unwrapProxyPath(pathname) {
+  // 匹配 /http://... 或 /https://...
+  const match = pathname.match(/^\/(https?:\/\/.+)$/i)
+  if (!match) return null
+  // 直接返回匹配结果，不做 decodeURIComponent（避免破坏特殊字符编码）
+  return match[1]
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 function formatShanghaiTime(timestamp) {
