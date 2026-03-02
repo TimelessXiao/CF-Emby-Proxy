@@ -6,6 +6,8 @@ dist/
 .env.local
 .ace-tool/
 .claude/
+.codex/
+.gemini/
 wrangler.json
 .dev.vars
 wrangler.toml
