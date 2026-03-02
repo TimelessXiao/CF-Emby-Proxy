@@ -1,58 +1,83 @@
 # CF-Emby-Proxy
 
-基于 Cloudflare Workers 的 Emby 反向代理与边缘加速方案，支持动态路由、细粒度缓存策略和可视化管理。
+<p align="center">
+  <strong>一个部署在 Cloudflare 上的高性能 Emby 代理，内置多层缓存与可视化管理界面，让您的媒体库快如闪电。</strong>
+</p>
 
-- 仓库地址: <https://github.com/TimelessXiao/CF-Emby-Proxy>
-- 运行时: Cloudflare Workers + Hono
-- Node.js: >= 18
+<p align="center">
+  <a href="https://github.com/TimelessXiao/CF-Emby-Proxy"><img src="https://img.shields.io/badge/GitHub-CF--Emby--Proxy-52B54B?logo=github" alt="GitHub"></a>
+  <a href="#"><img src="https://img.shields.io/badge/License-ISC-blue.svg" alt="License"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Node.js-%3E%3D18-green.svg" alt="Node.js"></a>
+  <a href="#"><img src="https://img.shields.io/badge/Cloudflare-Workers-orange.svg" alt="Cloudflare Workers"></a>
+</p>
 
-## 目录
+---
 
-- [核心能力](#核心能力)
-- [项目结构](#项目结构)
-- [请求处理与缓存策略](#请求处理与缓存策略)
-- [动态路由与管理接口](#动态路由与管理接口)
-- [安全策略](#安全策略)
-- [快速开始](#快速开始)
-- [配置说明](#配置说明)
-- [开发与调试](#开发与调试)
-- [常见场景](#常见场景)
-- [许可证](#许可证)
+## ✨ 核心亮点
 
-## 核心能力
+- 🚀 **多层缓存策略** - 智能利用 Worker 内存、Cloudflare Cache API 和 KV 存储，大幅减少回源请求，提升加载速度
+- 🎨 **可视化管理界面** - 内置 `/manage` 管理页面，支持动态路由配置、批量操作、导入导出和版本回滚
+- 🛡️ **强化安全机制** - SSRF 防护、凭证保护、缓存隔离，确保代理安全可靠
+- ⚙️ **动态路由管理** - 按子域名灵活路由到不同 Emby 上游，支持 pathPrefix 和代理路径模式
+- 📊 **性能监控优化** - Server-Timing 注入、媒体播放稳定性优化、Range 请求智能处理
 
-1. Emby 请求代理
-- 按子域名动态选择上游 Emby。
-- 支持 `pathPrefix`，可将不同子域路由到不同上游路径。
+## 🏗️ 架构概览
 
-2. 多层路由缓存（配置层）
-- L1: Worker 内存缓存（默认 60s）。
-- L2: Cloudflare Cache API（软 TTL 60s，硬 TTL 30 天）。
-- L3: KV 持久化存储（版本化文档）。
+```mermaid
+graph LR
+    A[用户请求] --> B[Cloudflare Edge]
+    B --> C[CF Worker<br/>CF-Emby-Proxy]
+    C --> D{路由缓存}
+    D -->|L1: 内存| E[60s TTL]
+    D -->|L2: Cache API| F[软 60s / 硬 30天]
+    D -->|L3: KV Storage| G[版本化存储]
+    C --> H{内容缓存}
+    H -->|图片| I[长期缓存 1年]
+    H -->|API| J[微缓存 10s]
+    H -->|M3U8| K[微缓存 2s]
+    H -->|PlaybackInfo| L[微缓存 3s]
+    C --> M[Emby 上游服务器]
+    C --> N[管理界面<br/>/manage]
+```
 
-3. 媒体播放稳定性优化
-- 媒体/Range 请求独立的 TTFB 超时控制（默认 15s）。
-- 失败重试、退避、空闲 watchdog、客户端取消信号透传。
-- 对特定媒体路径与播放器进行“原生流直通（bypass）”。
+> **请求流程**：用户请求经 Cloudflare 边缘到达 Worker，Worker 通过三级路由缓存选择上游，并根据内容类型应用不同缓存策略，最终代理到 Emby 服务器或直接返回缓存内容。
 
-4. 精细缓存策略（内容层）
-- PlaybackInfo POST 微缓存（3s，带请求体 hash）。
-- API 端点微缓存（10s，带 query 去噪 + token 隔离）。
-- M3U8 微缓存（2s）。
-- 图片长期缓存 / 空 tag 图片短缓存（90s）。
+---
 
-5. 管理界面与管理 API
-- `/manage` 内置管理页面。
-- 支持新增、编辑、删除、批量删除、导入、导出、回滚。
-- 基于版本号（`If-Match`）做并发写保护。
+## 🚀 快速开始
 
-6. 调试与可观测性
-- `Server-Timing` 注入（采样 + 媒体强制记录）。
-- 可选非 2xx 详细日志，支持脱敏。
+### 前置要求
 
-## 项目结构
+- Node.js >= 18
+- Cloudflare 账户
+- npm 或 yarn
 
-```text
+### 部署步骤
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/TimelessXiao/CF-Emby-Proxy.git
+cd CF-Emby-Proxy
+
+# 2. 安装依赖
+npm install
+
+# 3. 交互式配置（推荐）
+npm run setup
+# 脚本会自动完成：Cloudflare 认证、KV namespace 创建、wrangler.json 生成、ADMIN_TOKEN 设置
+
+# 4. 部署到 Cloudflare
+npm run deploy
+
+# 5. 访问管理界面
+# 打开 https://your-worker-url/manage 开始配置路由
+```
+
+---
+
+## 📋 项目结构
+
+```
 src/
   worker.js      # 核心代理、缓存、安全与管理 API
   ui.js          # /manage 管理界面 HTML
@@ -65,61 +90,80 @@ wrangler.json.example  # 示例部署配置（可提交）
 wrangler.json          # 本地实际配置（默认 git 忽略）
 ```
 
-## 请求处理与缓存策略
+---
 
-### 1) 路由选择
+## 🛠️ 配置说明
 
-常规模式：
-- 从请求 hostname 提取一级子域名。
-- 在路由映射中按 `subdomain` 查找上游。
-- 未命中时使用 `default`，再回退 `UPSTREAM_URL`。
+<details>
+<summary><strong>点击展开 wrangler.json 配置详情</strong></summary>
 
-代理路径模式：
-- 当路径形如 `/https://target.example/path` 时，直接代理到目标 URL。
-- 会附带原始 query 参数。
+### 必须配置
 
-### 2) 主要缓存规则
+- **kv_namespaces**: 绑定 `ROUTE_MAP` 用于存储路由映射
+- **Secret**: `ADMIN_TOKEN` 用于保护管理 API
 
-1. PlaybackInfo（POST）
-- 路径匹配 `/PlaybackInfo`。
-- 仅在可缓冲请求体且存在真实 token 时启用。
-- 以 `hostname + pathname + sorted query + token hash + body hash` 作为缓存键。
-- TTL: 3 秒（`PLAYBACKINFO_TTL`）。
+### 环境变量 (vars)
 
-2. API 微缓存（GET）
-- 覆盖 `/Items`、`/Items/Resume`、`/Users/*/Items/Latest`、`/Users/*/Views`、`/Shows/NextUp`。
-- `SortBy=Random` 会绕过缓存。
-- 仅保留白名单 query 参数构建缓存键，减少噪声。
-- TTL: 10 秒（`s-maxage=10`）。
+```json
+{
+  "UPSTREAM_URL": "https://your-emby-server.com",  // 默认上游（无路由命中时兜底）
+  "DEBUG": "false",                                 // 启用调试模式
+  "DEBUG_LOG_NON_2XX": "false",                    // 记录非 2xx 详细日志
+  "DEBUG_LOG_REDACT": "true"                       // 日志脱敏
+}
+```
 
-3. M3U8（GET）
-- 匹配 `.m3u8`。
-- 带 token hash 缓存键隔离。
-- TTL: 2 秒。
+### 可选配置
 
-4. 图片缓存
-- 带有效 `tag` 的 Items 图片：长期缓存（1 年，`immutable`）。
-- 无 `tag` 且匿名请求的 Items 图片：短缓存（90s）。
-- `/Users/`、`/Persons/` 相关图片不走匿名长期缓存。
+- `ROUTE_CACHE_HOST`: 路由 L2 缓存 key 的隔离 host（不配则使用内置默认）
 
-5. 视频 / Range
-- 不走常规边缘缓存。
-- 强制 `Accept-Encoding: identity`，降低媒体中间链路异常概率。
+### 非交互模式（CI/CD）
 
-### 3) 媒体稳定性逻辑
+当 `CI=true` 或 `SETUP_NONINTERACTIVE=1` 时，setup 脚本支持环境变量配置：
 
-- TTFB 超时：`MEDIA_TTFB_TIMEOUT_MS`（默认 15000ms）。
-- 网络错误快速重试（幂等请求）。
-- 首块读取超时 + 空闲超时 watchdog。
-- 特定条件下 bypass JS 包装流，直接透传上游 body：
-  - Range 请求
-  - 媒体 MIME 类型
-  - 典型媒体路径（含 `/Videos/`、`/Items/*/Stream`、`/stream/*`、媒体后缀）
-  - 原生播放器特征（如 infuse/exoplayer/mpv）
+```bash
+export KV_NAMESPACE_ID="your-kv-id"
+export KV_PREVIEW_ID="your-preview-kv-id"  # 可选
+export CLOUDFLARE_API_TOKEN="your-token"   # 可选
+export ADMIN_TOKEN="your-admin-token"      # 可选
+npm run setup
+```
 
-## 动态路由与管理接口
+</details>
 
-### 路由数据模型
+---
+
+## 🎯 核心功能详解
+
+### 1. 多层路由缓存
+
+路由配置采用三级缓存架构，确保高可用和低延迟：
+
+- **L1 (内存缓存)**: 60 秒 TTL，Worker 实例内存
+- **L2 (Cache API)**: 软 TTL 60 秒，硬 TTL 30 天，Cloudflare 边缘缓存
+- **L3 (KV Storage)**: 版本化持久存储，支持回滚
+
+### 2. 精细缓存策略
+
+| 内容类型 | 缓存策略 | TTL | 说明 |
+|---------|---------|-----|------|
+| **图片（带 tag）** | 长期缓存 | 1 年 | immutable，基于 tag 参数 |
+| **图片（无 tag）** | 短缓存 | 90 秒 | 匿名请求 |
+| **API 端点** | 微缓存 | 10 秒 | query 去噪 + token 隔离 |
+| **PlaybackInfo** | 微缓存 | 3 秒 | POST 请求，带 body hash |
+| **M3U8** | 微缓存 | 2 秒 | 播放清单 |
+| **视频/Range** | 不缓存 | - | 直通上游，优化 TTFB |
+
+### 3. 媒体播放优化
+
+- **TTFB 超时控制**: 默认 15 秒，适配慢速上游
+- **智能重试机制**: 网络错误快速重试，带退避策略
+- **空闲 watchdog**: 防止播放过程中连接假死
+- **原生流直通**: Range 请求和原生播放器（Infuse/ExoPlayer/MPV）绕过 JS 包装，直接透传上游 body
+
+### 4. 动态路由
+
+**常规模式**：按子域名选择上游
 
 ```json
 {
@@ -138,135 +182,138 @@ wrangler.json          # 本地实际配置（默认 git 忽略）
 }
 ```
 
-### 版本化存储
+**代理路径模式**：直接代理任意 URL
 
-- 当前指针：`routes:current`
-- 历史版本：`routes:v{timestamp}`
-- 每次写入生成新版本并记录 `prev`，支持回滚。
-
-### 管理界面
-
-- 路径: `/manage`
-- 认证: `Authorization: Bearer <ADMIN_TOKEN>`
-
-### 管理 API（均需 Bearer Token）
-
-- `GET /manage/api/mappings` 读取当前映射和版本
-- `PUT /manage/api/mappings/:sub` 新增/更新路由
-- `DELETE /manage/api/mappings/:sub` 删除路由
-- `POST /manage/api/batch-delete` 批量删除
-- `GET /manage/api/export` 导出配置
-- `POST /manage/api/import` 导入配置
-- `POST /manage/api/rollback` 回滚到上一个或指定版本
-
-并发写保护：
-- 通过 `If-Match` + 当前版本做乐观锁。
-- 冲突返回 `409 Version conflict`。
-
-## 安全策略
-
-1. SSRF 防护
-- 代理路径模式仅允许 `http/https`。
-- 拒绝内网/保留地址（IPv4/IPv6/localhost 等）。
-- 重定向目标也会做同样校验。
-
-2. 凭证保护
-- 代理路径模式下剥离 `Authorization`、`Cookie`、`X-Emby-Token` 等敏感头，防止泄露到第三方。
-
-3. 缓存隔离
-- 基于 `token + deviceId` 计算 SHA-256 缓存键，避免跨用户缓存污染。
-
-4. 协议头治理
-- 清理 hop-by-hop headers，降低中间层协议不兼容问题。
-
-## 快速开始
-
-### 1) 安装依赖
-
-```bash
-npm install
+```
+https://proxy.example.com/https://cdn.example.com/video.mkv?sign=xxx
 ```
 
-### 2) 运行初始化脚本（推荐）
+### 5. 管理界面与 API
+
+**管理界面**: `/manage` (需要 Bearer Token 认证)
+
+**管理 API**:
+- `GET /manage/api/mappings` - 读取当前映射和版本
+- `PUT /manage/api/mappings/:sub` - 新增/更新路由
+- `DELETE /manage/api/mappings/:sub` - 删除路由
+- `POST /manage/api/batch-delete` - 批量删除
+- `GET /manage/api/export` - 导出配置
+- `POST /manage/api/import` - 导入配置
+- `POST /manage/api/rollback` - 回滚到指定版本
+
+**并发写保护**: 通过 `If-Match` + 版本号实现乐观锁，冲突返回 `409 Version conflict`
+
+### 6. 安全策略
+
+- **SSRF 防护**: 代理路径模式仅允许 http/https，拒绝内网/保留地址
+- **凭证保护**: 代理模式下剥离 Authorization、Cookie、X-Emby-Token 等敏感头
+- **缓存隔离**: 基于 token + deviceId 计算 SHA-256 缓存键，避免跨用户污染
+- **协议头治理**: 清理 hop-by-hop headers，降低中间层协议不兼容
+
+## 💻 开发与调试
+
+<details>
+<summary><strong>点击展开开发指南</strong></summary>
+
+### 本地开发
 
 ```bash
-npm run setup
-```
-
-`scripts/setup.js` 会引导你完成：
-- Cloudflare 认证（`wrangler login` 或 API Token）
-- KV namespace 创建或复用
-- 从 `wrangler.json.example` 生成 `wrangler.json`
-- 设置 `ADMIN_TOKEN` Secret
-- 基础配置验证
-
-### 3) 本地调试
-
-```bash
+# 启动本地开发服务器
 npm run dev
+
+# 访问 http://localhost:8787
 ```
-
-### 4) 部署
-
-```bash
-npm run deploy
-```
-
-## 配置说明
-
-### wrangler 关键项
-
-必须配置：
-- `kv_namespaces` 绑定 `ROUTE_MAP`
-- Secret `ADMIN_TOKEN`
-
-常用 vars：
-- `UPSTREAM_URL`: 默认上游（无路由命中时兜底）
-- `DEBUG`: `true/false`
-- `DEBUG_LOG_NON_2XX`: 是否记录非 2xx 详细日志
-- `DEBUG_LOG_REDACT`: 是否对日志脱敏
-
-可选 vars：
-- `ROUTE_CACHE_HOST`: 路由 L2 缓存 key 的隔离 host（不配则使用内置默认）
-
-### setup 非交互模式（CI 可用）
-
-当 `CI=true` 或 `SETUP_NONINTERACTIVE=1` 时：
-
-必需环境变量：
-- `KV_NAMESPACE_ID`
-
-可选环境变量：
-- `CLOUDFLARE_API_TOKEN`
-- `KV_PREVIEW_ID`
-- `ADMIN_TOKEN`
-
-## 开发与调试
 
 ### NPM Scripts
 
-- `npm run setup`: 初始化环境
-- `npm run dev`: 本地开发
-- `npm run deploy`: 部署到 Cloudflare
+- `npm run setup` - 初始化环境
+- `npm run dev` - 本地开发
+- `npm run deploy` - 部署到 Cloudflare
 
-### 日志与诊断
+### 调试工具
 
-启用 `DEBUG=true` 后，响应会按采样附带 `Server-Timing`。
-可通过 `wrangler tail` 结合 `DEBUG_LOG_NON_2XX` 观察异常请求详情。
+启用 `DEBUG=true` 后，响应会附带 `Server-Timing` 头：
 
-## 常见场景
+```
+Server-Timing: kind;desc="api", client;desc="client", player_hint;desc="infuse",
+               kv_read;dur=5, cache_hit;desc="1", upstream;dur=120,
+               retry;desc="0", subreq;desc="1"
+```
 
-1. 多线路分流
-- `a.example.com` 和 `b.example.com` 指向不同 Emby 上游。
-- 通过 `/manage` 在线增删路由，约 60 秒内全局生效（受缓存 TTL 影响）。
+配合 `wrangler tail` 可实时查看请求日志：
 
-2. 复杂跨域资源代理
-- 使用路径模式：`https://proxy.example.com/https://cdn.example.com/video.mkv?token=...`
-- Worker 会处理重定向并继续包裹为代理路径，避免断链。
+```bash
+npx wrangler tail --config wrangler.json
+```
 
-3. 降低首页接口延迟
-- 使用 API 微缓存和 PlaybackInfo 微缓存，减少频繁回源。
+### 性能监控
 
-## 许可证
+- **采样率**: 默认 10% 请求记录 Server-Timing（媒体请求强制记录）
+- **详细日志**: `DEBUG_LOG_NON_2XX=true` 记录非 2xx 响应详情
+- **日志脱敏**: `DEBUG_LOG_REDACT=true` 自动脱敏敏感信息
+
+</details>
+
+## 🌟 常见场景
+
+### 多线路分流
+
+将 `a.example.com` 和 `b.example.com` 指向不同 Emby 上游，通过 `/manage` 在线配置，约 60 秒内全局生效。
+
+### 跨域资源代理
+
+使用代理路径模式处理跨域资源：
+
+```
+https://proxy.example.com/https://cdn.example.com/video.mkv?token=xxx
+```
+
+Worker 会自动处理重定向并继续包裹为代理路径，避免断链。
+
+### 降低首页接口延迟
+
+利用 API 微缓存和 PlaybackInfo 微缓存，减少频繁回源，首页加载速度提升明显。
+
+## ❓ 常见问题
+
+<details>
+<summary><strong>Q: 如何更新路由配置？</strong></summary>
+
+访问 `/manage` 管理界面，使用 Bearer Token 认证后即可在线编辑路由。配置会自动同步到 KV 并刷新缓存。
+
+</details>
+
+<details>
+<summary><strong>Q: 缓存多久生效？</strong></summary>
+
+路由配置缓存 TTL 为 60 秒，更新后最多 60 秒内全局生效。内容缓存根据类型不同，TTL 从 2 秒到 1 年不等。
+
+</details>
+
+<details>
+<summary><strong>Q: 如何回滚配置？</strong></summary>
+
+使用管理 API 的 `/manage/api/rollback` 端点，或在管理界面点击回滚按钮。每次配置更新都会生成新版本，支持回滚到任意历史版本。
+
+</details>
+
+<details>
+<summary><strong>Q: 支持哪些播放器？</strong></summary>
+
+支持所有 Emby 官方客户端和第三方播放器（Infuse、ExoPlayer、MPV 等）。对原生播放器会自动启用流直通优化。
+
+</details>
+
+## 📄 许可证
 
 ISC License
+
+---
+
+<p align="center">
+  <strong>仓库地址</strong>: <a href="https://github.com/TimelessXiao/CF-Emby-Proxy">https://github.com/TimelessXiao/CF-Emby-Proxy</a>
+</p>
+
+<p align="center">
+  <strong>运行时</strong>: Cloudflare Workers + Hono | <strong>Node.js</strong>: >= 18
+</p>
