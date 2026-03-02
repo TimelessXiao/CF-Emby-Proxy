@@ -107,6 +107,7 @@ const CACHE_QUERY_ALLOWLIST = new Set([
 // Tag 参数校验正则（用于匿名图片缓存）
 const TAG_HEX_REGEX = /^[a-f0-9]{8,128}$/i
 const TAG_BASE64URL_REGEX = /^[A-Za-z0-9_-]{8,128}$/
+const DIRECT_STREAM_PATH_REGEX = /^\/stream(?:\/|$)/i
 
 // 扩展媒体后缀正则（含清单文件，用于 bypass 判定；与 CONFIG.MEDIA_EXT_REGEX 保持同步）
 const EXT_MEDIA_REGEX = /\.(mp4|mkv|ts|m3u8|mpd|mov|avi|flv|webm|mp3|aac|flac|wav|m4a|ogg|opus|m4s|cmf|ismv|wmv|rmvb|rm|3gp|asf|vob|divx)$/i
@@ -423,7 +424,8 @@ app.all('*', async (c) => {
   const isLegacyImage = /^\/Images\/(Primary|Backdrop|Logo|Thumb|Banner|Art|Still|Box|Screenshot|Chapter|Menu|Disc|Poster)/i.test(effectivePathname)
   const isImage = isItemImage || isLegacyImage
   const isStatic = isStaticAsset || isImage
-  const isVideo = CONFIG.VIDEO_REGEX.test(effectivePathname)
+  const isVideo = CONFIG.VIDEO_REGEX.test(effectivePathname) ||
+                  (isProxyMode && isLikelyProxyMediaPath(targetUrl.pathname))
   const isApiCacheable = req.method === 'GET' &&
                          CONFIG.API_CACHE_REGEX.test(effectivePathname) &&
                          !CONFIG.API_CACHE_BYPASS_REGEX.test(url.search)
@@ -1331,6 +1333,12 @@ function mappingToBase(mapping) {
   }
 }
 
+function isLikelyProxyMediaPath(pathname) {
+  const path = typeof pathname === 'string' ? pathname : ''
+  if (!path) return false
+  return DIRECT_STREAM_PATH_REGEX.test(path) || EXT_MEDIA_REGEX.test(path)
+}
+
 async function fetchWithTimeout(url, options, timeout) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeout);
@@ -1441,7 +1449,7 @@ function shouldBypassWrap(resp, options = {}, cfg = {}, url = '', playerHint = n
 
   // P0: VIDEO_REGEX 路径检测（/Videos/, /Items/.../Stream, /Items/.../Download）
   const urlStr = typeof url === 'string' ? url : (url?.toString?.() || '')
-  const isVideoPath = CONFIG.VIDEO_REGEX.test(urlStr)
+  const isVideoPath = CONFIG.VIDEO_REGEX.test(urlStr) || isLikelyProxyMediaUrl(urlStr)
 
   // P0: Content-Length 阈值检测（降低阈值提升 bypass 命中率）
   const contentLength = parseInt(resp.headers.get('content-length') || '0', 10) || 0
@@ -1481,6 +1489,15 @@ function shouldBypassWrap(resp, options = {}, cfg = {}, url = '', playerHint = n
   }
 
   return { bypass, reason }
+}
+
+function isLikelyProxyMediaUrl(urlStr) {
+  try {
+    const u = new URL(urlStr)
+    return isLikelyProxyMediaPath(u.pathname)
+  } catch {
+    return false
+  }
 }
 
 // 首块探测：仅读取第一块数据验证上游活性
