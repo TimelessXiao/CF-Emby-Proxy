@@ -1,4 +1,4 @@
-# CF-Emby-Proxy
+<h1 align="center">CF-Emby-Proxy</h1>
 
 <p align="center">
   <strong>一个部署在 Cloudflare 上的高性能 Emby 代理，内置多层缓存与可视化管理界面，让您的媒体库快如闪电。</strong>
